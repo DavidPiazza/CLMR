@@ -1,0 +1,11 @@
+LICENSE
+README.md
+setup.py
+clmr.egg-info/PKG-INFO
+clmr.egg-info/SOURCES.txt
+clmr.egg-info/dependency_links.txt
+clmr.egg-info/requires.txt
+clmr.egg-info/top_level.txt
+tests/test_audioset.py
+tests/test_dataset.py
+tests/test_spectogram.py
