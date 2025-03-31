@@ -52,7 +52,15 @@ class LinearEvaluation(LightningModule):
         x, y = batch
         loss, preds = self.forward(x, y)
 
-        self.log("Train/accuracy", self.accuracy(preds, y))
+        # Convert target to integer tensor before calculating accuracy
+        if self.hparams.dataset in ["magnatagatune", "msd"]:
+            # For multi-label datasets, use argmax to get integer predictions
+            y_int = torch.argmax(y, dim=1) if len(y.shape) > 1 else y.long()
+        else:
+            # For single-label datasets, ensure y is a long tensor
+            y_int = y.long()
+        
+        self.log("Train/accuracy", self.accuracy(preds, y_int))
         # self.log("Train/pr_auc", self.average_precision(preds, y))
         self.log("Train/loss", loss)
         return loss
@@ -60,8 +68,16 @@ class LinearEvaluation(LightningModule):
     def validation_step(self, batch, _) -> Tensor:
         x, y = batch
         loss, preds = self.forward(x, y)
-
-        self.log("Valid/accuracy", self.accuracy(preds, y))
+        
+        # Convert target to integer tensor before calculating accuracy
+        if self.hparams.dataset in ["magnatagatune", "msd"]:
+            # For multi-label datasets, use argmax to get integer predictions
+            y_int = torch.argmax(y, dim=1) if len(y.shape) > 1 else y.long()
+        else:
+            # For single-label datasets, ensure y is a long tensor
+            y_int = y.long()
+        
+        self.log("Valid/accuracy", self.accuracy(preds, y_int))
         # self.log("Valid/pr_auc", self.average_precision(preds, y))
         self.log("Valid/loss", loss)
         return loss
