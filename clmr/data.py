@@ -12,17 +12,49 @@ class ContrastiveDataset(Dataset):
         self.dataset = dataset
         self.transform = transform
         self.input_shape = input_shape
-        self.ignore_idx = []
+        self.ignore_idx = set()  # Using a set for faster lookups
+        self.is_pruned = hasattr(dataset, 'indices_to_keep')
+        self.max_retries = 10  # Maximum number of retries for finding a valid index
+
+    def _get_valid_index(self, idx: int) -> int:
+        """Find a valid index by trying subsequent indices."""
+        original_idx = idx
+        retries = 0
+        
+        while retries < self.max_retries:
+            try:
+                # Try to access the index
+                audio, _ = self.dataset[idx]
+                if audio.shape[1] >= self.input_shape[1]:
+                    return idx
+            except (IndexError, RecursionError):
+                pass
+            
+            # Try next index
+            idx = (idx + 1) % len(self.dataset)
+            retries += 1
+            
+            # If we've wrapped around to the original index, stop
+            if idx == original_idx:
+                break
+        
+        # If we couldn't find a valid index, raise an error
+        raise RuntimeError(f"Could not find valid index after {self.max_retries} retries")
 
     def __getitem__(self, idx) -> Tuple[Tensor, Tensor]:
         if idx in self.ignore_idx:
-            return self[idx + 1]
+            idx = self._get_valid_index((idx + 1) % len(self.dataset))
 
-        audio, label = self.dataset[idx]
+        try:
+            audio, label = self.dataset[idx]
+        except (IndexError, RecursionError):
+            idx = self._get_valid_index((idx + 1) % len(self.dataset))
+            audio, label = self.dataset[idx]
 
         if audio.shape[1] < self.input_shape[1]:
-            self.ignore_idx.append(idx)
-            return self[idx + 1]
+            self.ignore_idx.add(idx)
+            idx = self._get_valid_index((idx + 1) % len(self.dataset))
+            audio, label = self.dataset[idx]
 
         if self.transform:
             audio = self.transform(audio)

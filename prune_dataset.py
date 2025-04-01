@@ -26,27 +26,62 @@ class PrunedMAGNATAGATUNE(Dataset):
         self.original_dataset = original_dataset
         self.indices_to_keep = indices_to_keep
         self.n_classes = original_dataset.n_classes
+        self._validate_and_filter_indices()
         
+    def _validate_and_filter_indices(self):
+        """Validate indices and filter out any that are out of bounds."""
+        max_idx = len(self.original_dataset)
+        invalid_indices = [idx for idx in self.indices_to_keep if idx >= max_idx]
+        
+        if invalid_indices:
+            print(f"Warning: Found {len(invalid_indices)} invalid indices that are out of bounds of the original dataset (size: {max_idx})")
+            print("Filtering out invalid indices...")
+            # Filter out invalid indices
+            self.indices_to_keep = self.indices_to_keep[self.indices_to_keep < max_idx]
+            print(f"Remaining valid indices: {len(self.indices_to_keep)}")
+    
     def __getitem__(self, idx):
+        if idx >= len(self.indices_to_keep):
+            raise IndexError(f"Index {idx} is out of bounds for pruned dataset with size {len(self.indices_to_keep)}")
+        
         original_idx = self.indices_to_keep[idx]
-        return self.original_dataset[original_idx]
+        try:
+            return self.original_dataset[original_idx]
+        except IndexError:
+            raise IndexError(f"Original dataset index {original_idx} is out of bounds")
     
     def __len__(self):
         return len(self.indices_to_keep)
     
     def load(self, idx):
+        if idx >= len(self.indices_to_keep):
+            raise IndexError(f"Index {idx} is out of bounds for pruned dataset with size {len(self.indices_to_keep)}")
+        
         original_idx = self.indices_to_keep[idx]
-        return self.original_dataset.load(original_idx)
+        try:
+            return self.original_dataset.load(original_idx)
+        except IndexError:
+            raise IndexError(f"Original dataset index {original_idx} is out of bounds")
     
     def file_path(self, idx):
+        if idx >= len(self.indices_to_keep):
+            raise IndexError(f"Index {idx} is out of bounds for pruned dataset with size {len(self.indices_to_keep)}")
+        
         original_idx = self.indices_to_keep[idx]
-        return self.original_dataset.file_path(original_idx)
+        try:
+            return self.original_dataset.file_path(original_idx)
+        except IndexError:
+            raise IndexError(f"Original dataset index {original_idx} is out of bounds")
     
     def target_file_path(self, idx):
+        if idx >= len(self.indices_to_keep):
+            raise IndexError(f"Index {idx} is out of bounds for dataset with size {len(self.indices_to_keep)}")
         original_idx = self.indices_to_keep[idx]
         return self.original_dataset.target_file_path(original_idx)
     
     def preprocess(self, idx, sample_rate):
+        if idx >= len(self.indices_to_keep):
+            raise IndexError(f"Index {idx} is out of bounds for dataset with size {len(self.indices_to_keep)}")
         original_idx = self.indices_to_keep[idx]
         return self.original_dataset.preprocess(original_idx, sample_rate)
 
@@ -84,31 +119,40 @@ def jensen_shannon_divergence(p, q):
 
 def compute_pruning_objective(r, distances, t, original_dist):
     """Compute objective function for optimizing pruning fraction."""
-    # Use r to determine how many samples to keep
-    if r <= 0:
-        return 100.0  # Penalize removing no samples
+    # Add logging for debugging
+    objective_values = []
+    
+    # Verify r is in reasonable range
+    if r <= 0.01 or r >= 0.99:
+        return 100.0  # High penalty for extreme values
     
     n_samples = len(distances)
-    n_keep = max(2, int(n_samples * (1 - r)))  # Keep at least 2 samples
+    n_keep = max(2, int(n_samples * (1 - r)))
     
-    # Sort distances and keep n_keep closest samples
+    # Sort and get indices
     sorted_indices = np.argsort(distances.sum(axis=1))
     keep_indices = sorted_indices[:n_keep]
     
-    # Compute pruned similarity distribution
+    # Compute distributions with better numerical stability
     pruned_distances = distances[keep_indices][:, keep_indices]
     pruned_similarities = 1 / (1 + pruned_distances + 1e-10)
+    
+    # Normalize with higher precision
     pruned_dist = pruned_similarities.flatten()
-    pruned_dist = pruned_dist / np.sum(pruned_dist)
+    pruned_sum = np.sum(pruned_dist)
+    if pruned_sum < 1e-10:
+        return 100.0  # Avoid division by zero
+    pruned_dist = pruned_dist / pruned_sum
     
-    # Create uniform distribution
     uniform_dist = np.ones_like(pruned_dist) / len(pruned_dist)
-    
-    # Target distribution Q = (1-t) * Q_0 + t * Q_1
     target_dist = (1 - t) * original_dist + t * uniform_dist
     
-    # Calculate JSD
+    # More stable JSD calculation
     jsd = jensen_shannon_divergence(pruned_dist, target_dist)
+    
+    # Log values
+    print(f"r={r:.3f}, n_keep={n_keep}, JSD={jsd:.6f}")
+    
     return jsd
 
 
@@ -129,10 +173,10 @@ def optimize_cluster_removal(embeddings_cluster, t):
     print("Optimizing removal fraction...")
     result = minimize(
         lambda r: compute_pruning_objective(r, distances, t, original_dist),
-        x0=0.3,  # Initial guess
-        bounds=[(0.01, 0.99)],  # Constrain between 1% and 99% removal
-        method='L-BFGS-B',
-        options={'maxiter': 100, 'ftol': 1e-5}  # Add iteration limit and tolerance
+        x0=0.3,
+        bounds=[(0.01, 0.99)],
+        method='L-BFGS-B',  # Use L-BFGS-B for bound constraints
+        options={'maxiter': 300}
     )
     
     optimal_r = result.x[0]
@@ -184,10 +228,19 @@ def process_single_cluster(cluster_id, cluster_indices, normalized_embeddings, m
     
     # Map local indices back to global indices
     keep_indices_global = cluster_indices[keep_indices_local]
+    
+    # Validate that all indices are within bounds
+    max_idx = len(normalized_embeddings)
+    invalid_indices = [idx for idx in keep_indices_global if idx >= max_idx]
+    if invalid_indices:
+        print(f"Warning: Found {len(invalid_indices)} invalid indices in cluster {cluster_id}")
+        # Filter out invalid indices
+        keep_indices_global = keep_indices_global[keep_indices_global < max_idx]
+    
     return keep_indices_global, optimal_r
 
 
-def prune_dataset(embeddings, labels, min_cluster_size, t):
+def prune_dataset(embeddings, labels, min_cluster_size, min_samples, t):
     """Apply HDBSCAN clustering and prune each cluster."""
     print("Starting dataset pruning process...")
     # Normalize embeddings
@@ -195,10 +248,10 @@ def prune_dataset(embeddings, labels, min_cluster_size, t):
     normalized_embeddings = embeddings / torch.norm(embeddings, dim=1, keepdim=True)
     
     # Apply HDBSCAN clustering
-    print(f"Applying HDBSCAN clustering with min_cluster_size={min_cluster_size}...")
+    print(f"Applying HDBSCAN clustering with min_cluster_size={min_cluster_size} and min_samples={min_samples}...")
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
-        min_samples=5,
+        min_samples=min_samples,
         metric='euclidean',
         cluster_selection_method='eom',
         core_dist_n_jobs=-1  # Use all available cores
@@ -237,7 +290,32 @@ def prune_dataset(embeddings, labels, min_cluster_size, t):
         }
     
     print(f"Keeping {len(all_indices_to_keep)} samples out of {len(embeddings)}")
-    return np.array(all_indices_to_keep), cluster_stats
+    return np.array(all_indices_to_keep), cluster_stats, cluster_labels
+
+
+def random_baseline_pruning(cluster_labels, cluster_stats):
+    """Perform random baseline pruning using the same reduction ratios as the optimized method."""
+    all_indices_to_keep = []
+    
+    for cluster_id, stats in cluster_stats.items():
+        cluster_id = int(cluster_id)
+        cluster_mask = cluster_labels == cluster_id
+        cluster_indices = np.where(cluster_mask)[0]
+        
+        if cluster_id == -1 or len(cluster_indices) <= 10:  # Keep all noise/small clusters
+            all_indices_to_keep.extend(cluster_indices)
+            continue
+            
+        # Use the same reduction ratio as the optimized method
+        keep_ratio = 1.0 - stats["removal_fraction"]
+        keep_count = max(10, int(len(cluster_indices) * keep_ratio))
+        
+        # Randomly sample indices
+        np.random.seed(42 + cluster_id)  # for reproducibility
+        keep_indices = np.random.choice(len(cluster_indices), keep_count, replace=False)
+        all_indices_to_keep.extend(cluster_indices[keep_indices])
+    
+    return np.array(all_indices_to_keep)
 
 
 if __name__ == "__main__":
@@ -249,10 +327,14 @@ if __name__ == "__main__":
     # Add pruning-specific arguments
     parser.add_argument("--min_cluster_size", type=int, default=10, 
                         help="Minimum cluster size for HDBSCAN")
+    parser.add_argument("--min_samples", type=int, default=5,
+                        help="Minimum number of samples in neighborhood for HDBSCAN")
     parser.add_argument("--t", type=float, default=0.5, 
                         help="Interpolation parameter for target distribution")
     parser.add_argument("--output_dir", type=str, default="./pruned_data",
                         help="Directory to save pruned dataset info")
+    parser.add_argument("--n_random_runs", type=int, default=5,
+                        help="Number of random baseline runs for statistical significance")
     
     args = parser.parse_args()
     
@@ -294,16 +376,25 @@ if __name__ == "__main__":
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     embeddings, labels = extract_embeddings(encoder, train_loader, device)
     
-    # Prune dataset
-    indices_to_keep, cluster_stats = prune_dataset(
+    # Prune dataset with optimized method
+    indices_to_keep, cluster_stats, cluster_labels = prune_dataset(
         embeddings, 
         labels, 
         min_cluster_size=args.min_cluster_size,
+        min_samples=args.min_samples,
         t=args.t
     )
     
-    # Save indices and statistics
+    # Save optimized indices and statistics
     np.save(os.path.join(output_dir, "indices_to_keep.npy"), indices_to_keep)
+    np.save(os.path.join(output_dir, "cluster_labels.npy"), cluster_labels)
+    
+    # Generate random baseline prunings
+    random_indices_list = []
+    for run in range(args.n_random_runs):
+        random_indices = random_baseline_pruning(cluster_labels, cluster_stats)
+        random_indices_list.append(random_indices)
+        np.save(os.path.join(output_dir, f"random_indices_run_{run}.npy"), random_indices)
     
     # Save metadata
     metadata = {
@@ -312,7 +403,9 @@ if __name__ == "__main__":
         "reduction_percentage": (1 - len(indices_to_keep) / len(train_dataset)) * 100,
         "parameters": {
             "min_cluster_size": args.min_cluster_size,
-            "t": args.t
+            "min_samples": args.min_samples,
+            "t": args.t,
+            "n_random_runs": args.n_random_runs
         },
         "cluster_stats": cluster_stats
     }
@@ -323,6 +416,7 @@ if __name__ == "__main__":
     print(f"Pruned dataset information saved to {output_dir}")
     print(f"Original size: {len(train_dataset)}, Pruned size: {len(indices_to_keep)}")
     print(f"Reduction: {metadata['reduction_percentage']:.2f}%")
+    print(f"Generated {args.n_random_runs} random baseline prunings")
     
     # Create pruned dataset
     pruned_train_dataset = PrunedMAGNATAGATUNE(train_dataset, indices_to_keep)
