@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from .model import Model
+from torch import Tensor
 
 
 class SampleCNN(Model):
@@ -48,6 +49,7 @@ class SampleCNN(Model):
                 nn.Conv1d(512, 512, kernel_size=3, stride=1, padding=1),
                 nn.BatchNorm1d(512),
                 nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
             )
         )
 
@@ -57,11 +59,14 @@ class SampleCNN(Model):
             self.dropout = nn.Dropout(0.5)
         self.fc = nn.Linear(512, out_dim)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
+        # x is the input received from LinearEvaluation
+        print(f"[SampleCNN] Input shape to sequential: {x.shape}")
         out = self.sequential(x)
+
         if self.supervised:
             out = self.dropout(out)
 
-        out = out.reshape(x.shape[0], out.size(1) * out.size(2))
+        out = out.reshape(x.shape[0], -1)
         logit = self.fc(out)
         return logit

@@ -28,8 +28,22 @@ class LinearEvaluation(LightningModule):
             self.model = nn.Sequential(nn.Linear(self.hidden_dim, self.output_dim))
         self.criterion = self.configure_criterion()
 
-        self.accuracy = torchmetrics.Accuracy()
-        self.average_precision = torchmetrics.AveragePrecision(pos_label=1)
+        # Determine the task type and number of classes
+        # Assuming multiclass based on n_classes usage elsewhere
+        num_classes = output_dim
+        task_type = "multiclass"
+        if output_dim == 1: # Simple heuristic for binary
+            task_type = "binary"
+        elif output_dim > 1: # Could potentially be multilabel depending on dataset
+            # If dataset implies multilabel, change task_type="multilabel"
+            # For now, stick with multiclass based on output_dim > 1
+            pass 
+
+        self.accuracy = torchmetrics.Accuracy(task=task_type, num_classes=num_classes)
+        self.precision_metric = torchmetrics.Precision(task=task_type, num_classes=num_classes)
+        self.recall = torchmetrics.Recall(task=task_type, num_classes=num_classes)
+        self.f1_score = torchmetrics.F1Score(task=task_type, num_classes=num_classes)
+        self.auc = torchmetrics.AUROC(task=task_type, num_classes=num_classes)
 
     def forward(self, x: Tensor, y: Tensor) -> Tuple[Tensor, Tensor]:
         preds = self._forward_representations(x, y)
@@ -41,6 +55,7 @@ class LinearEvaluation(LightningModule):
         Perform a forward pass using either the representations, or the input data (that we still)
         need to extract the represenations from using our encoder.
         """
+        print(f"[LinearEvaluation] Input shape to encoder: {x.shape}")
         if x.shape[-1] == self.hidden_dim:
             h0 = x
         else:
@@ -61,7 +76,6 @@ class LinearEvaluation(LightningModule):
             y_int = y.long()
         
         self.log("Train/accuracy", self.accuracy(preds, y_int))
-        # self.log("Train/pr_auc", self.average_precision(preds, y))
         self.log("Train/loss", loss)
         return loss
 
@@ -78,7 +92,6 @@ class LinearEvaluation(LightningModule):
             y_int = y.long()
         
         self.log("Valid/accuracy", self.accuracy(preds, y_int))
-        # self.log("Valid/pr_auc", self.average_precision(preds, y))
         self.log("Valid/loss", loss)
         return loss
 
