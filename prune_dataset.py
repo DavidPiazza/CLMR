@@ -117,67 +117,42 @@ def jensen_shannon_divergence(p, q):
     return 0.5 * (np.sum(p * np.log(p / m + 1e-10)) + np.sum(q * np.log(q / m + 1e-10)))
 
 
-def compute_pruning_objective(r_array, distances, t, original_dist):
-    """Compute the objective function for pruning (JSD)."""
-    r = r_array[0] # Extract scalar value from the array passed by minimize
+def compute_pruning_objective(r, distances, t, original_dist):
+    """Compute objective function for optimizing pruning fraction."""
+    # Add logging for debugging
+    objective_values = []
+    
+    # Verify r is in reasonable range
+    if r <= 0.01 or r >= 0.99:
+        return 100.0  # High penalty for extreme values
+    
     n_samples = len(distances)
-    # Ensure at least 2 samples are kept for distance calculation
-    n_keep = max(2, int(n_samples * (1 - r))) # Use scalar r
-
-    # Select indices to keep based on centrality (sum of distances)
+    n_keep = max(2, int(n_samples * (1 - r)))
+    
+    # Sort and get indices
     sorted_indices = np.argsort(distances.sum(axis=1))
     keep_indices = sorted_indices[:n_keep]
-
+    
     # Compute distributions with better numerical stability
     pruned_distances = distances[keep_indices][:, keep_indices]
-    # Similarities based on pruned distances. Epsilon added for stability.
     pruned_similarities = 1 / (1 + pruned_distances + 1e-10)
-
-    # Normalize the similarity distribution of the pruned set
+    
+    # Normalize with higher precision
     pruned_dist = pruned_similarities.flatten()
     pruned_sum = np.sum(pruned_dist)
     if pruned_sum < 1e-10:
-        # Avoid division by zero/near-zero; return large penalty
-        return 100.0
+        return 100.0  # Avoid division by zero
     pruned_dist = pruned_dist / pruned_sum
-
-    # Target distribution: interpolate between original and uniform
+    
     uniform_dist = np.ones_like(pruned_dist) / len(pruned_dist)
-    # Ensure original_dist is properly subset and reshaped if needed
-    # This part assumes original_dist corresponds flat pairwise similarities
-    # It might need careful handling if original_dist was derived from all N samples
-    # and pruned_dist is from n_keep samples. Let's assume it's handled correctly upstream
-    # or that target_dist calculation adapts.
-    # For simplicity, let's assume target_dist needs reshaping based on n_keep:
-    target_dist_flat = (1 - t) * original_dist + t * (np.ones_like(original_dist) / len(original_dist))
-    # We need to figure out how to compare pruned_dist (size n_keep*n_keep)
-    # with target_dist (size N*N). This seems like a potential issue.
-    # Re-reading optimize_cluster_removal: original_dist is calculated once on the whole cluster.
-    # Re-reading compute_pruning_objective: target_dist uses original_dist directly.
-
-    # Let's assume the intent is to compare the distribution within the *kept* set
-    # to a target derived from the *original* distribution of the *whole* cluster.
-    # This comparison might be dimensionally mismatched if not handled carefully.
-    # However, the code uses `jensen_shannon_divergence` which expects same-sized inputs.
-    # Perhaps `original_dist` needs to be re-calculated or sampled/approximated for the pruned set size?
-    # Or maybe the uniform distribution calculation is also based on the original size N?
-
-    # Let's re-examine the target_dist line based on the JSD call expecting same-sized inputs:
-    # The comparison likely happens between `pruned_dist` (shape k*k) and a similarly shaped target.
-    # It might be comparing the pruned distribution to a target that's also derived from the k*k space?
-    # Let's assume the code intends:
-    original_dist_subset = original_dist.reshape(n_samples, n_samples)[keep_indices][:, keep_indices].flatten()
-    original_dist_subset = original_dist_subset / np.sum(original_dist_subset) # Renormalize subset
-    uniform_dist_subset = np.ones_like(pruned_dist) / len(pruned_dist)
-    target_dist = (1 - t) * original_dist_subset + t * uniform_dist_subset
-
-
+    target_dist = (1 - t) * original_dist + t * uniform_dist
+    
     # More stable JSD calculation
-    jsd = jensen_shannon_divergence(pruned_dist, target_dist) # Requires pruned_dist and target_dist to be same shape
-
-    # Log values using scalar r
+    jsd = jensen_shannon_divergence(pruned_dist, target_dist)
+    
+    # Log values
     print(f"r={r:.3f}, n_keep={n_keep}, JSD={jsd:.6f}")
-
+    
     return jsd
 
 
@@ -198,7 +173,7 @@ def optimize_cluster_removal(embeddings_cluster, t):
     print("Optimizing removal fraction...")
     result = minimize(
         lambda r: compute_pruning_objective(r, distances, t, original_dist),
-        x0=0.2,
+        x0=0.3,
         bounds=[(0.01, 0.99)],
         method='L-BFGS-B',  # Use L-BFGS-B for bound constraints
         options={'maxiter': 300}
@@ -244,24 +219,11 @@ def process_single_cluster(cluster_id, cluster_indices, normalized_embeddings, m
         try:
             keep_indices_local, optimal_r = optimize_cluster_removal(cluster_embeddings, t)
         except Exception as e:
-            # --- Add logging here ---
-            print(f"Optimization failed for cluster {cluster_id} with size {len(cluster_indices)}. Error: {e}. Using fallback r=0.3.")
-            # --- End logging ---
-
+            print(f"Error in optimization for cluster {cluster_id}: {e}")
             # Fallback to a simple strategy
             keep_ratio = 0.7  # Keep 70% as a fallback
             keep_count = max(min_cluster_size, int(len(cluster_indices) * keep_ratio))
-            # Refined fallback: Keep the most central points
-            try:
-                # Recalculate distances just for fallback sorting (might be slow, use n_jobs=1)
-                distances_fallback = pairwise_distances(cluster_embeddings, n_jobs=1)
-                sorted_indices_fallback = np.argsort(distances_fallback.sum(axis=1))
-                keep_indices_local = sorted_indices_fallback[:keep_count]
-            except Exception as fallback_e:
-                print(f"Error during fallback centrality calculation for cluster {cluster_id}: {fallback_e}. Using arbitrary first k.")
-                # Original arbitrary fallback if centrality calculation also fails
-                keep_indices_local = np.arange(keep_count)
-
+            keep_indices_local = np.arange(keep_count)  # Keep the first keep_count samples
             optimal_r = 1.0 - keep_ratio
     
     # Map local indices back to global indices
@@ -387,8 +349,14 @@ if __name__ == "__main__":
     test_dataset = get_dataset(args.dataset, args.dataset_dir, subset="test")
     
     # Setup dataloaders
+    contrastive_train_dataset = ContrastiveDataset(
+        train_dataset,
+        input_shape=(1, args.audio_length),
+        transform=None  # No transformations for embedding extraction
+    )
+    
     train_loader = DataLoader(
-        train_dataset,  # Use the original dataset
+        contrastive_train_dataset,
         batch_size=args.batch_size,
         num_workers=args.workers,
         shuffle=False  # Don't shuffle to keep track of indices
@@ -404,14 +372,8 @@ if __name__ == "__main__":
     state_dict = load_encoder_checkpoint(args.checkpoint_path, train_dataset.n_classes)
     encoder.load_state_dict(state_dict)
     
-    # Update device selection logic to handle MPS
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        device = "mps"
-    elif torch.cuda.is_available():
-        device = "cuda:0"
-    else:
-        device = "cpu"
-
+    # Extract embeddings
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     embeddings, labels = extract_embeddings(encoder, train_loader, device)
     
     # Prune dataset with optimized method

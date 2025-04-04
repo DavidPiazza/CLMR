@@ -1,6 +1,8 @@
-torch
-torchvision
+simclr
+torchaudio-augmentations
+torch==1.9.0
 torchaudio
-lightning
+pytorch-lightning
 soundfile
-scikit-learn
+sklearn
+matplotlib

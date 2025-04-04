@@ -3,11 +3,12 @@
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
-from typing import Tuple, List, Optional, Callable
+from torchaudio_augmentations import Compose
+from typing import Tuple, List
 
 
 class ContrastiveDataset(Dataset):
-    def __init__(self, dataset: Dataset, input_shape: List[int], transform: Optional[Callable] = None):
+    def __init__(self, dataset: Dataset, input_shape: List[int], transform: Compose):
         self.dataset = dataset
         self.transform = transform
         self.input_shape = input_shape
@@ -55,15 +56,8 @@ class ContrastiveDataset(Dataset):
             idx = self._get_valid_index((idx + 1) % len(self.dataset))
             audio, label = self.dataset[idx]
 
-        # Create two copies of the audio for contrastive learning
-        if self.transform is not None:
-            audio_i = self.transform(audio)
-            audio_j = self.transform(audio)
-            audio = torch.stack([audio_i, audio_j], dim=0)
-        else:
-            # If no transform is provided, just duplicate the audio
-            audio = torch.stack([audio, audio], dim=0)
-
+        if self.transform:
+            audio = self.transform(audio)
         return audio, label
 
     def __len__(self) -> int:
@@ -75,7 +69,7 @@ class ContrastiveDataset(Dataset):
         batch = torch.cat(batch[:-1])
         batch = batch.unsqueeze(dim=1)
 
-        if self.transform is not None:
+        if self.transform:
             batch = self.transform(batch)
 
         return batch

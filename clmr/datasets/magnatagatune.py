@@ -7,97 +7,19 @@ import zipfile
 from collections import defaultdict
 from typing import Any, Tuple, Optional
 from tqdm import tqdm
-import urllib.request
-import hashlib
 
 import soundfile as sf
 import torchaudio
 
+torchaudio.set_audio_backend("soundfile")
 from torch import Tensor, FloatTensor
+from torchaudio.datasets.utils import (
+    download_url,
+    extract_archive,
+)
+
 from clmr.datasets import Dataset
 
-
-def download_url(url: str, root: str, filename: Optional[str] = None, hash_value: Optional[str] = None, hash_type: str = "md5") -> None:
-    """Download a file from a url and place it in root.
-    Args:
-        url (str): URL to download file from
-        root (str): Directory to place downloaded file in
-        filename (str, optional): Name to save the file under. If None, use the basename of the URL
-        hash_value (str, optional): Hash for checking the integrity of the downloaded file
-        hash_type (str): Hash type, among "md5" or "sha256"
-    """
-    if filename is None:
-        filename = os.path.basename(url)
-    
-    os.makedirs(root, exist_ok=True)
-    filepath = os.path.join(root, filename)
-
-    if os.path.isfile(filepath):
-        if hash_value is None:
-            return
-        if check_hash(filepath, hash_value, hash_type):
-            return
-        else:
-            warnings.warn(f'{filename} exists, but the hash does not match. Re-downloading.')
-    
-    print(f'Downloading {url} to {filepath}')
-    urllib.request.urlretrieve(url, filepath)
-
-def extract_archive(from_path: str, to_path: Optional[str] = None) -> str:
-    """Extract an archive.
-    Args:
-        from_path (str): Path to the archive.
-        to_path (str, optional): Path to extract to. If None, extract to the same directory.
-    Returns:
-        str: Path to the directory the archive was extracted to.
-    """
-    if to_path is None:
-        to_path = os.path.dirname(from_path)
-
-    with zipfile.ZipFile(from_path, 'r') as zf:
-        zf.extractall(to_path)
-    
-    return to_path
-
-def check_hash(filepath: str, hash_value: str, hash_type: str = "md5") -> bool:
-    """Check the hash of a file.
-    Args:
-        filepath (str): Path to the file
-        hash_value (str): Hash to validate against
-        hash_type (str): Hash type, among "md5" or "sha256"
-    Returns:
-        bool: True if the hash matches, else False
-    """
-    if hash_type == "md5":
-        hash_func = hashlib.md5()
-    elif hash_type == "sha256":
-        hash_func = hashlib.sha256()
-    else:
-        raise ValueError(f'Unsupported hash type: {hash_type}')
-
-    with open(filepath, "rb") as f:
-        chunk = f.read(1024 * 1024)
-        while chunk:
-            hash_func.update(chunk)
-            chunk = f.read(1024 * 1024)
-    
-    return hash_func.hexdigest() == hash_value
-
-def convert_mp3_to_wav(mp3_path: str, wav_path: str) -> None:
-    """Convert an MP3 file to WAV format using torchaudio.
-    Args:
-        mp3_path (str): Path to the MP3 file
-        wav_path (str): Path to save the WAV file
-    """
-    if os.path.exists(wav_path):
-        return
-    
-    os.makedirs(os.path.dirname(wav_path), exist_ok=True)
-    try:
-        waveform, sample_rate = torchaudio.load(mp3_path)
-        torchaudio.save(wav_path, waveform, sample_rate)
-    except Exception as e:
-        warnings.warn(f"Error converting {mp3_path} to WAV: {str(e)}")
 
 FOLDER_IN_ARCHIVE = "magnatagatune"
 _CHECKSUMS = {
@@ -226,15 +148,6 @@ class MAGNATAGATUNE(Dataset):
 
                 extract_archive(merged_zip)
 
-            # Convert MP3 files to WAV format
-            print("Converting MP3 files to WAV format...")
-            for root_dir, _, files in os.walk(self._path):
-                for file in tqdm(files):
-                    if file.endswith(".mp3"):
-                        mp3_path = os.path.join(root_dir, file)
-                        wav_path = os.path.join(root_dir, file.replace(".mp3", ".wav"))
-                        convert_mp3_to_wav(mp3_path, wav_path)
-
         if not os.path.isdir(self._path):
             raise RuntimeError(
                 "Dataset not found. Please use `download=True` to download it."
@@ -251,8 +164,6 @@ class MAGNATAGATUNE(Dataset):
 
     def file_path(self, n: int) -> str:
         _, fp = self.fl[n].split("\t")
-        # Convert MP3 path to WAV path
-        fp = fp.replace(".mp3", ".wav")
         return os.path.join(self._path, fp)
 
     def __getitem__(self, n: int) -> Tuple[Tensor, Tensor]:

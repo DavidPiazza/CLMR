@@ -1,48 +1,36 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm, trange
+from torch.utils.data import Dataset
+from tqdm import tqdm
 from sklearn import metrics
-import numpy as np
-from torch import Tensor
-
-
-def calculate_overall_metrics(predictions, labels):
-    """Calculate overall metrics like AUC_ROC and PR_AUC."""
-    roc_auc = metrics.roc_auc_score(labels, predictions, average="macro")
-    pr_auc = metrics.average_precision_score(labels, predictions, average="macro")
-    return {"AUC_ROC": roc_auc, "PR_AUC": pr_auc}
 
 
 def evaluate(
     encoder: nn.Module,
     finetuned_head: nn.Module,
-    test_loader: DataLoader,
+    test_dataset: Dataset,
     dataset_name: str,
     audio_length: int,
-    device="cpu",
+    device,
 ) -> dict:
+    est_array = []
+    gt_array = []
+
+    encoder = encoder.to(device)
     encoder.eval()
-    finetuned_head.eval()
-    encoder.to(device)
-    finetuned_head.to(device)
 
-    # Enable mixed precision
-    scaler = torch.cuda.amp.GradScaler()
-    
-    all_predictions = []
-    all_labels = []
+    if finetuned_head is not None:
+        finetuned_head = finetuned_head.to(device)
+        finetuned_head.eval()
 
-    with torch.no_grad(), torch.cuda.amp.autocast():
-        for batch_x, batch_y in tqdm(test_loader, desc="Evaluate", leave=False):
-            batch_x = batch_x.to(device, non_blocking=True)  # Use non-blocking transfers
-            batch_y = batch_y.to(device, non_blocking=True)
+    with torch.no_grad():
+        for idx in tqdm(range(len(test_dataset))):
+            _, label = test_dataset[idx]
+            batch = test_dataset.concat_clip(idx, audio_length)
+            batch = batch.to(device)
 
-            output = encoder(batch_x)
-            if output.dim() > 2:  # Handle potential extra dimensions from SampleCNN reshape
-                output = output.reshape(batch_x.shape[0], -1)
-
+            output = encoder(batch)
             if finetuned_head:
                 output = finetuned_head(output)
 
@@ -52,36 +40,21 @@ def evaluate(
             else:
                 output = F.softmax(output, dim=1)
 
-            # Store per-sample predictions, not the batch mean
-            # track_prediction = output.mean(dim=0)
-            all_predictions.append(output.cpu().numpy()) 
-            all_labels.append(batch_y.cpu().numpy())
+            track_prediction = output.mean(dim=0)
+            est_array.append(track_prediction)
+            gt_array.append(label)
 
-    # Concatenate results from all batches
-    all_predictions = np.concatenate(all_predictions, axis=0)
-    all_labels = np.concatenate(all_labels, axis=0)
+    if dataset_name in ["magnatagatune", "msd"]:
+        est_array = torch.stack(est_array, dim=0).cpu().numpy()
+        gt_array = torch.stack(gt_array, dim=0).cpu().numpy()
+        roc_aucs = metrics.roc_auc_score(gt_array, est_array, average="macro")
+        pr_aucs = metrics.average_precision_score(gt_array, est_array, average="macro")
+        return {
+            "PR-AUC": pr_aucs,
+            "ROC-AUC": roc_aucs,
+        }
 
-    # Calculate metrics
-    results = calculate_overall_metrics(all_predictions, all_labels)
-
-    # TODO: Add per-tag metrics if needed
-    # tags = get_tags_for_dataset(dataset_name) # Need a function to get tag names
-    # if tags:
-    #     per_tag_results = calculate_per_tag_metrics(all_predictions, all_labels, tags)
-    #     results.update(per_tag_results)
-
-    encoder.cpu()
-    finetuned_head.cpu()
-    return results
-
-
-# Placeholder for potential per-tag metric calculation
-# def calculate_per_tag_metrics(predictions, labels, tags):
-#     # ... implementation ...
-#     pass
-
-
-# Placeholder for getting tags
-# def get_tags_for_dataset(dataset_name):
-#     # ... implementation ...
-#     pass
+    est_array = torch.stack(est_array, dim=0)
+    _, est_array = torch.max(est_array, 1)  # extract the predicted labels here.
+    accuracy = metrics.accuracy_score(gt_array, est_array)
+    return {"Accuracy": accuracy}

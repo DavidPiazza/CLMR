@@ -4,11 +4,11 @@ import numpy as np
 import torch
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
+from torchaudio_augmentations import Compose, RandomResizedCrop
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 import json
-import time
 
 from clmr.datasets import get_dataset
 from clmr.data import ContrastiveDataset
@@ -24,34 +24,6 @@ from clmr.utils import (
 # Import custom pruned dataset class
 from prune_dataset import PrunedMAGNATAGATUNE
 
-# Add a simple wrapper to crop audio
-from torch.utils.data import Dataset
-
-class CropAudioDataset(Dataset):
-    def __init__(self, base_dataset, length):
-        self.base_dataset = base_dataset
-        self.length = length
-
-    def __getitem__(self, idx):
-        audio, label = self.base_dataset[idx]
-        # Ensure audio has channel dimension (assuming mono)
-        if audio.dim() == 1:
-            audio = audio.unsqueeze(0)
-        elif audio.dim() > 2:
-             # If more than 2 dims, take the first channel
-             audio = audio[0, ...].unsqueeze(0)
-
-        # Pad if shorter
-        if audio.shape[-1] < self.length:
-            pad_len = self.length - audio.shape[-1]
-            # Pad last dimension (length)
-            audio = torch.nn.functional.pad(audio, (0, pad_len))
-        # Crop the audio (take first N samples)
-        audio = audio[..., :self.length]
-        return audio, label
-
-    def __len__(self):
-        return len(self.base_dataset)
 
 def load_pruned_dataset(args):
     """Load a pruned dataset from the specified path."""
@@ -91,105 +63,72 @@ def evaluate_multiple_runs(args, indices_list, run_names, train_dataset, valid_d
         if adjusted_batch_size != args.finetuner_batch_size:
             print(f"Warning: Adjusted batch size from {args.finetuner_batch_size} to {adjusted_batch_size} to match pruned dataset size")
         
-        # Apply training transforms only to the training set
-        # Assuming PrunedMAGNATAGATUNE.__getitem__ needs transforms applied after getting the item
-        # Let's modify PrunedMAGNATAGATUNE or wrap it if needed
-        # For now, assuming transforms can be handled by DataLoader or are part of the base dataset structure
-        # Let's focus on cropping validation/test data first.
-
-        # --- Apply cropping to validation and test datasets --- 
-        valid_dataset_cropped = CropAudioDataset(valid_dataset, args.audio_length)
-        test_dataset_cropped = CropAudioDataset(test_dataset, args.audio_length)
-        # --- End Cropping ---
-
-        # --- Wrap training dataset as well ---
-        train_dataset_cropped = CropAudioDataset(pruned_train_dataset, args.audio_length)
-        # --- End Wrapping ---
-
-        # Create DataLoaders directly
-        # Training transform is currently not applied; revisit if needed.
+        # Setup dataloaders
+        contrastive_train_dataset = ContrastiveDataset(
+            pruned_train_dataset,
+            input_shape=(1, args.audio_length),
+            transform=Compose(train_transform),
+        )
+        
+        contrastive_valid_dataset = ContrastiveDataset(
+            valid_dataset,
+            input_shape=(1, args.audio_length),
+            transform=Compose(train_transform),
+        )
+        
+        contrastive_test_dataset = ContrastiveDataset(
+            test_dataset,
+            input_shape=(1, args.audio_length),
+            transform=None,
+        )
+        
+        print(f"Contrastive train dataset size: {len(contrastive_train_dataset)}")
+        print(f"Contrastive valid dataset size: {len(contrastive_valid_dataset)}")
+        print(f"Contrastive test dataset size: {len(contrastive_test_dataset)}")
+        
         train_loader = DataLoader(
-            train_dataset_cropped,
+            contrastive_train_dataset,
             batch_size=adjusted_batch_size,
             num_workers=args.workers,
             shuffle=True,
-            persistent_workers=True
         )
         
         valid_loader = DataLoader(
-            valid_dataset_cropped, # Use the cropped validation dataset
+            contrastive_valid_dataset,
             batch_size=adjusted_batch_size,
             num_workers=args.workers,
             shuffle=False,
         )
         
-        # Create a separate test_loader for the final evaluation
         test_loader = DataLoader(
-            test_dataset_cropped,
-            batch_size=args.batch_size,
+            contrastive_test_dataset,
+            batch_size=adjusted_batch_size,
+            num_workers=args.workers,
             shuffle=False,
-            num_workers=4,  # Use multiple workers for data loading
-            pin_memory=True,  # Use pinned memory for faster CPU-GPU transfers
-            persistent_workers=True  # Keep workers alive between epochs
         )
         
         # Train and evaluate
-        exp_dir = os.path.join(os.getcwd(), "runs", args.eval_name)
-        run_dir = os.path.join(exp_dir, run_name)
-        os.makedirs(run_dir, exist_ok=True)
-        checkpoint_dir = os.path.join(run_dir, "checkpoints")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        tb_logger = TensorBoardLogger(save_dir=exp_dir, name=run_name)
-        
-        # Determine accelerator and devices
-        if hasattr(args, 'gpus') and args.gpus is not None and args.gpus > 0 and torch.cuda.is_available():
-            accelerator = 'gpu'
-            devices = args.gpus
-        elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-            accelerator = 'mps'
-            devices = 1
-        else:
-            accelerator = 'cpu'
-            devices = 1
-            print("Warning: GPUs or MPS not available, using CPU. Training may be slow.")
-
-        trainer = Trainer(
-            max_epochs=args.finetuner_max_epochs, 
-            logger=tb_logger,
-            callbacks=[
-                EarlyStopping(monitor="Valid/loss", patience=10, mode="min"),
-                ModelCheckpoint(
-                    dirpath=checkpoint_dir,
-                    filename="{epoch}-{Valid/loss:.2f}",
-                    monitor="Valid/loss",
-                    save_last=True,
-                    mode="min",
-                ),
-                LearningRateMonitor(logging_interval="step"),
-            ],
-            accelerator=accelerator,
-            devices=devices,
-            log_every_n_steps=10, # Add a reasonable logging frequency
-            # Add other relevant trainer args if needed, checking args namespace or using defaults
-            # precision=(args.precision if hasattr(args, 'precision') else 32), 
+        early_stop_callback = EarlyStopping(
+            monitor="Valid/loss", patience=10, verbose=False, mode="min"
         )
-
-        start = time.time()
+        
+        trainer = Trainer.from_argparse_args(
+            args,
+            logger=TensorBoardLogger(
+                "runs", name=f"CLMRv2-{run_name}-{args.dataset}"
+            ),
+            max_epochs=args.finetuner_max_epochs,
+            callbacks=[early_stop_callback],
+        )
+        
         trainer.fit(module, train_loader, valid_loader)
         
         # Evaluate
-        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-            device = "mps"
-        elif args.gpus and torch.cuda.is_available():
-            device = "cuda:0"
-        else:
-            device = "cpu"
-        
+        device = "cuda:0" if args.gpus else "cpu"
         results = evaluate(
             module.encoder,
             module.model,
-            test_loader, # Pass the test loader object now
+            contrastive_test_dataset,
             args.dataset,
             args.audio_length,
             device=device,
@@ -198,7 +137,7 @@ def evaluate_multiple_runs(args, indices_list, run_names, train_dataset, valid_d
         results_list.append(results)
         
         # Save results for this run
-        with open(os.path.join(run_dir, "results.txt"), "w") as f:
+        with open(os.path.join(results_dir, f"{run_name}_results.txt"), "w") as f:
             for k, v in results.items():
                 f.write(f"{k}: {v}\n")
     
@@ -226,8 +165,7 @@ def compute_statistical_significance(optimized_results, random_results):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate pruned dataset")
-    # Remove or comment out the deprecated line
-    # parser = Trainer.add_argparse_args(parser)
+    parser = Trainer.add_argparse_args(parser)
 
     config = yaml_config_hook("./config/config.yaml")
     for k, v in config.items():
@@ -239,10 +177,6 @@ if __name__ == "__main__":
     parser.add_argument("--eval_name", type=str, default="pruned-eval",
                         help="Name for the evaluation run")
     
-    # Add evaluation-specific arguments
-    parser.add_argument("--use_random_baseline", type=int, default=-1,
-                        help="If >= 0, use the specified random baseline run index instead of the optimized indices.")
-
     args = parser.parse_args()
     pl.seed_everything(args.seed)
     args.accelerator = None
@@ -319,7 +253,7 @@ if __name__ == "__main__":
         results = evaluate(
             module.encoder,
             module.model,
-            test_dataset,
+            contrastive_test_dataset,
             args.dataset,
             args.audio_length,
             device=device,
