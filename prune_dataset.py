@@ -730,7 +730,7 @@ if __name__ == "__main__":
         encoder.load_state_dict(state_dict)
         
         # Extract embeddings
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = "mps" if torch.backends.mps.is_available() else "cuda:0" if torch.cuda.is_available() else "cpu"
         embeddings, labels = extract_embeddings(encoder, train_loader, device)
         
         # Save embeddings for future use
