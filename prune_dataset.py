@@ -255,9 +255,11 @@ def compute_pruning_objective(r, distances, t, original_summary_hist):
     return float(jsd)  # Ensure we return a scalar
 
 
-def grid_search_optimal_removal(distances, t, original_summary_hist):
-    """Find optimal removal fraction using grid search instead of optimizer."""
-    grid_points = np.linspace(0.1, 0.90, 20)  # 19 points from 5% to 95% removal, in 5% steps
+def grid_search_optimal_removal(distances, t, original_summary_hist,
+                                r_min=0.4, r_max=0.90, n_points=20):
+    """Find optimal removal fraction using grid search within [r_min, r_max]."""
+    assert 0.0 <= r_min < r_max <= 1.0, "Invalid r_min / r_max bounds"
+    grid_points = np.linspace(r_min, r_max, n_points)
     best_r = 0.4  # Default fallback
     best_score = float('inf')
     
@@ -390,7 +392,8 @@ def select_diverse_samples(embeddings_cluster: np.ndarray,
 # ----------------------------------------------------------------------
 
 
-def optimize_cluster_removal(embeddings_cluster, t, selection_method="mean_distance"):
+def optimize_cluster_removal(embeddings_cluster, t, r_min, r_max,
+                             selection_method="mean_distance"):
     """Find the optimal fraction of samples to remove from a cluster using grid search."""
     print(f"Starting optimization for cluster with {len(embeddings_cluster)} samples")
     
@@ -431,7 +434,10 @@ def optimize_cluster_removal(embeddings_cluster, t, selection_method="mean_dista
     # Find optimal removal fraction using grid search instead of optimizer
     try:
         # Use grid search instead of minimize
-        optimal_r = grid_search_optimal_removal(distances, t, original_hist_combined)
+        optimal_r = grid_search_optimal_removal(
+            distances, t, original_hist_combined,
+            r_min=r_min, r_max=r_max
+        )
         print(f"Grid search successful. Optimal removal fraction: {optimal_r:.4f}")
     except Exception as e:
         print(f"Grid search failed: {e}")
@@ -466,6 +472,8 @@ def process_single_cluster(
     cluster_indices,
     normalized_embeddings,
     min_cluster_size,
+    r_min,
+    r_max,
     t,
     selection_method="mean_distance",
 ):
@@ -504,7 +512,9 @@ def process_single_cluster(
         # requested diversity‑aware selector.
         try:
             keep_indices_local, optimal_r = optimize_cluster_removal(
-                cluster_embeddings, t, selection_method=selection_method
+                cluster_embeddings, t,
+                r_min, r_max,
+                selection_method=selection_method
             )
         except Exception as e:
             print(f"Error in optimization for cluster {cluster_id}: {e}")
@@ -547,6 +557,8 @@ def prune_dataset(
     min_cluster_size,
     min_samples,
     t,
+    r_min,
+    r_max,
     selection_method="mean_distance",
 ):
     """Apply HDBSCAN clustering and prune each cluster."""
@@ -589,6 +601,8 @@ def prune_dataset(
             cluster_indices,
             normalized_embeddings,
             min_cluster_size,
+            r_min,
+            r_max,
             t,
             selection_method,
         )
@@ -656,6 +670,12 @@ if __name__ == "__main__":
     parser.add_argument("--embeddings_path", type=str, default=None,
                         help="Path to pre-extracted embeddings (skip extraction if provided)")
     
+    # --- NEW: clamp the per-cluster removal fraction -------------------
+    parser.add_argument("--r_min", type=float, default=0.4,
+                        help="Minimum removal fraction per cluster [0–1]")
+    parser.add_argument("--r_max", type=float, default=0.90,
+                        help="Maximum removal fraction per cluster [0–1, > r_min]")
+
     # Intra‑cluster diversity selection strategy
     parser.add_argument("--selection_method", type=str, default="mean_distance",
                         choices=["mean_distance", "k_medoids", "dpp"],
@@ -724,6 +744,8 @@ if __name__ == "__main__":
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
         t=args.t,
+        r_min=args.r_min,
+        r_max=args.r_max,
         selection_method=args.selection_method
     )
 
