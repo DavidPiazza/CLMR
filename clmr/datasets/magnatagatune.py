@@ -11,9 +11,8 @@ from tqdm import tqdm
 import soundfile as sf
 import torchaudio
 
-torchaudio.set_audio_backend("soundfile")
 from torch import Tensor, FloatTensor
-from torchaudio.datasets.utils import (
+from torchvision.datasets.utils import (
     download_url,
     extract_archive,
 )

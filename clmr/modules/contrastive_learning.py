@@ -34,10 +34,15 @@ class ContrastiveLearning(LightningModule):
 
     def configure_criterion(self) -> nn.Module:
         # PT lightning aggregates differently in DP mode
-        if self.hparams.accelerator == "dp" and self.hparams.gpus:
+        batch_size = self.hparams.batch_size
+        
+        # Check if running in distributed mode
+        if hasattr(self.hparams, 'accelerator'):
+            if self.hparams.accelerator == "dp" and self.hparams.gpus:
+                batch_size = int(self.hparams.batch_size / self.hparams.gpus)
+        elif self.hparams.gpus and self.hparams.gpus > 1:
+            # Assume DP mode for backward compatibility
             batch_size = int(self.hparams.batch_size / self.hparams.gpus)
-        else:
-            batch_size = self.hparams.batch_size
 
         criterion = NT_Xent(batch_size, self.hparams.temperature, world_size=1)
         return criterion

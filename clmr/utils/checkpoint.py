@@ -3,7 +3,7 @@ from collections import OrderedDict
 
 
 def load_encoder_checkpoint(checkpoint_path: str, output_dim: int) -> OrderedDict:
-    state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+    state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"), weights_only=True)
     if "pytorch-lightning_version" in state_dict.keys():
         new_state_dict = OrderedDict(
             {
@@ -24,7 +24,7 @@ def load_encoder_checkpoint(checkpoint_path: str, output_dim: int) -> OrderedDic
 
 
 def load_finetuner_checkpoint(checkpoint_path: str) -> OrderedDict:
-    state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+    state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"), weights_only=True)
     if "pytorch-lightning_version" in state_dict.keys():
         state_dict = OrderedDict(
             {

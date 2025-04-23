@@ -1,0 +1,12 @@
+{
+  "PR-AUC": {
+    "t_statistic": 0.4243683140595218,
+    "p_value": 0.6931264682511102,
+    "significant": false
+  },
+  "ROC-AUC": {
+    "t_statistic": -3.259664565997853,
+    "p_value": 0.031090655318506293,
+    "significant": true
+  }
+}

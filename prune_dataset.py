@@ -107,97 +107,373 @@ def extract_embeddings(encoder, dataloader, device):
     return torch.cat(all_embeddings), torch.cat(all_labels)
 
 
+def save_embeddings(embeddings, labels, output_path):
+    """Save embeddings and labels to disk."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    torch.save({
+        'embeddings': embeddings,
+        'labels': labels
+    }, output_path)
+    print(f"Embeddings saved to {output_path}")
+
+
+def load_embeddings(embeddings_path):
+    """Load embeddings and labels from disk."""
+    if not os.path.exists(embeddings_path):
+        raise FileNotFoundError(f"Embeddings file not found at {embeddings_path}")
+    
+    print(f"Loading pre-extracted embeddings from {embeddings_path}")
+    data = torch.load(embeddings_path)
+    return data['embeddings'], data['labels']
+
+
 def jensen_shannon_divergence(p, q):
-    """Calculate Jensen-Shannon divergence between two distributions."""
-    # Make sure distributions sum to 1
-    p = p / np.sum(p)
-    q = q / np.sum(q)
+    """Calculate Jensen-Shannon divergence between two distributions with improved numerical stability."""
+    # Make sure distributions sum to 1 and handle zeros
+    p = np.maximum(p, 1e-10)
+    q = np.maximum(q, 1e-10)
+    
+    p_sum = np.sum(p)
+    q_sum = np.sum(q)
+    
+    if p_sum == 0 or q_sum == 0:
+        return 1.0  # Maximum divergence if either is all zeros
+        
+    p = p / p_sum
+    q = q / q_sum
     
     m = 0.5 * (p + q)
-    return 0.5 * (np.sum(p * np.log(p / m + 1e-10)) + np.sum(q * np.log(q / m + 1e-10)))
-
-
-def compute_pruning_objective(r, distances, t, original_dist):
-    """Compute objective function for optimizing pruning fraction."""
-    # Add logging for debugging
-    objective_values = []
     
+    # Use a more stable calculation with explicit handling of zeros
+    divergence1 = 0.0
+    for p_i, m_i in zip(p, m):
+        if p_i > 0 and m_i > 0:
+            divergence1 += p_i * np.log(p_i / m_i)
+    
+    divergence2 = 0.0
+    for q_i, m_i in zip(q, m):
+        if q_i > 0 and m_i > 0:
+            divergence2 += q_i * np.log(q_i / m_i)
+    
+    return 0.5 * (divergence1 + divergence2)
+
+
+def precompute_distance_summaries(distances):
+    """Precompute summary statistics for each sample's distances to others."""
+    n_samples = len(distances)
+    # For each sample, compute summary stats of its distances to all others
+    summaries = np.zeros((n_samples, 5))  # 5 summary statistics
+    
+    for i in range(n_samples):
+        dist_to_others = distances[i, :]
+        summaries[i, 0] = np.mean(dist_to_others)  # mean distance
+        summaries[i, 1] = np.std(dist_to_others)   # standard deviation
+        summaries[i, 2] = np.min(dist_to_others[dist_to_others > 0]) if np.any(dist_to_others > 0) else 0  # min non-zero
+        summaries[i, 3] = np.median(dist_to_others)  # median
+        summaries[i, 4] = np.percentile(dist_to_others, 75)  # 75th percentile
+    
+    return summaries
+
+
+def compute_pruning_objective(r, distances, t, original_summary_hist):
+    """Compute objective function for optimizing pruning fraction using summary statistics."""
     # Verify r is in reasonable range
     if r <= 0.01 or r >= 0.99:
         return 100.0  # High penalty for extreme values
     
-    n_samples = len(distances)
-    n_keep = max(2, int(n_samples * (1 - r)))
+    # Ensure r is a scalar - extract first element if it's an array
+    r_scalar = float(r[0]) if hasattr(r, "__len__") else float(r)
     
-    # Sort and get indices
-    sorted_indices = np.argsort(distances.sum(axis=1))
+    n_samples = len(distances)
+    n_keep = max(2, int(n_samples * (1 - r_scalar)))
+    
+    # Get summary stats for all samples
+    sample_summaries = precompute_distance_summaries(distances)
+    
+    # Sort based on centrality (mean distance to others)
+    # Lower mean distance = more central/representative
+    sorted_indices = np.argsort(sample_summaries[:, 0])
     keep_indices = sorted_indices[:n_keep]
     
-    # Compute distributions with better numerical stability
-    pruned_distances = distances[keep_indices][:, keep_indices]
-    pruned_similarities = 1 / (1 + pruned_distances + 1e-10)
+    # Get summaries of kept samples
+    kept_summaries = sample_summaries[keep_indices]
     
-    # Normalize with higher precision
-    pruned_dist = pruned_similarities.flatten()
-    pruned_sum = np.sum(pruned_dist)
-    if pruned_sum < 1e-10:
-        return 100.0  # Avoid division by zero
-    pruned_dist = pruned_dist / pruned_sum
+    # Create histograms for each summary statistic
+    hist_bins = 10  # Number of bins in histogram
+    kept_hists = []
     
-    uniform_dist = np.ones_like(pruned_dist) / len(pruned_dist)
-    target_dist = (1 - t) * original_dist + t * uniform_dist
+    # Create histograms for each of the 5 summary statistics
+    for i in range(sample_summaries.shape[1]):
+        # Get min/max across all samples for consistent binning
+        min_val = np.min(sample_summaries[:, i])
+        max_val = np.max(sample_summaries[:, i])
+        
+        # Handle edge case where min equals max
+        if min_val == max_val:
+            kept_hist = np.ones(hist_bins) / hist_bins
+        else:
+            bin_edges = np.linspace(min_val, max_val, hist_bins + 1)
+            kept_hist, _ = np.histogram(kept_summaries[:, i], bins=bin_edges, density=True)
+            # Ensure histogram sums to 1
+            if np.sum(kept_hist) > 0:
+                kept_hist = kept_hist / np.sum(kept_hist)
+            else:
+                kept_hist = np.ones(hist_bins) / hist_bins
+        
+        kept_hists.append(kept_hist)
     
-    # More stable JSD calculation
-    jsd = jensen_shannon_divergence(pruned_dist, target_dist)
+    # Combine histograms into a single feature vector
+    kept_hist_combined = np.concatenate(kept_hists)
     
-    # Log values
-    print(f"r={r:.3f}, n_keep={n_keep}, JSD={jsd:.6f}")
+    # Make sure both histograms have the same length before JSD calculation
+    if len(kept_hist_combined) != len(original_summary_hist):
+        print(f"Warning: Histogram length mismatch: {len(kept_hist_combined)} vs {len(original_summary_hist)}")
+        # Pad the shorter one with zeros or truncate the longer one
+        if len(kept_hist_combined) < len(original_summary_hist):
+            kept_hist_combined = np.pad(kept_hist_combined, 
+                                       (0, len(original_summary_hist) - len(kept_hist_combined)))
+        else:
+            kept_hist_combined = kept_hist_combined[:len(original_summary_hist)]
     
-    return jsd
+    # Create target distribution as interpolation between uniform and original distribution
+    uniform_dist = np.ones_like(original_summary_hist) / len(original_summary_hist)
+    target_dist = t * original_summary_hist + (1-t) * uniform_dist
+    # Normalize to ensure it sums to 1
+    target_dist = target_dist / np.sum(target_dist)
+    
+    # Compare with target distribution - use a more stable implementation
+    try:
+        jsd = jensen_shannon_divergence(kept_hist_combined, target_dist)
+    except Exception as e:
+        print(f"JSD calculation error: {e}")
+        # Fallback to a simple squared difference
+        jsd = np.sum((kept_hist_combined - target_dist)**2)
+    
+    # Log values for debugging - make sure to convert values to scalars for formatting
+    print(f"r={float(r_scalar):.3f}, n_keep={int(n_keep)}, JSD={float(jsd):.6f}, t={float(t):.2f}")
+    
+    return float(jsd)  # Ensure we return a scalar
 
 
-def optimize_cluster_removal(embeddings_cluster, t):
-    """Optimize the fraction of samples to remove from a cluster."""
+def grid_search_optimal_removal(distances, t, original_summary_hist):
+    """Find optimal removal fraction using grid search instead of optimizer."""
+    grid_points = np.linspace(0.1, 0.90, 20)  # 19 points from 5% to 95% removal, in 5% steps
+    best_r = 0.4  # Default fallback
+    best_score = float('inf')
+    
+    print("Starting grid search for optimal removal fraction...")
+    results = []
+    
+    for r in grid_points:
+        try:
+            score = compute_pruning_objective(r, distances, t, original_summary_hist)
+            results.append((r, score))
+            if score < best_score:
+                best_score = score
+                best_r = r
+        except Exception as e:
+            print(f"Error at r={r:.2f}: {e}")
+    
+    # Sort and display results for clarity
+    results.sort(key=lambda x: x[1])  # Sort by score
+    print("\nTop 5 best removal fractions:")
+    for r, score in results[:5]:
+        print(f"r={r:.2f}, score={score:.6f}")
+    
+    print(f"\nBest removal fraction: {best_r:.2f} with score: {best_score:.6f}")
+    return best_r
+
+
+# ==================  Diversity‑aware sample selection  ==================
+# This helper is used once the pruning fraction for a cluster has been
+# decided (inter‑cluster balance via the JSD term).  It is responsible
+# for picking which concrete samples are kept inside a cluster
+# (intra‑cluster coverage).
+
+def select_diverse_samples(embeddings_cluster: np.ndarray,
+                           k: int,
+                           method: str = "mean_distance",
+                           random_state: int = 42) -> np.ndarray:
+    """Select *k* diverse samples from *embeddings_cluster*.
+
+    Parameters
+    ----------
+    embeddings_cluster : np.ndarray(shape=(n_samples, n_features))
+        Embeddings belonging to one cluster (already on CPU / numpy).
+    k : int
+        Number of samples to return (``k <= n_samples``).
+    method : {"mean_distance", "k_medoids", "dpp"}
+        Strategy used for diversity selection.
+        * ``mean_distance`` ‑ greedily picks points with the highest mean
+          pairwise distance to all others (fast, no extra deps).
+        * ``k_medoids`` ‑ uses the medoid indices from the k‑Medoids
+          algorithm (requires ``sklearn‑extra``).
+        * ``dpp`` ‑ farthest‑point heuristic that approximates k‑DPP
+          sampling.
+    random_state : int
+        Seed used by stochastic algorithms.
+
+    Returns
+    -------
+    np.ndarray(shape=(k,))
+        Indices **local to the cluster** of the selected samples.
+    """
+
+    n_samples = embeddings_cluster.shape[0]
+    if k >= n_samples:
+        # Nothing to prune – keep everything.
+        return np.arange(n_samples)
+
+    method = method.lower()
+
+    # Pre‑compute pairwise distances once, they are reused by several
+    # strategies.  For very large clusters this could be memory hungry; in
+    # that case the caller should fall back to a simpler random strategy.
+    distances = pairwise_distances(embeddings_cluster, metric="euclidean")
+
+    if method == "mean_distance":
+        # Leave‑one‑out mean: exclude self‑distance (always 0) to avoid
+        # compressing the score range.
+        mean_dist = distances.sum(axis=1) / (distances.shape[1] - 1)
+        selected = np.argsort(-mean_dist)[:k]
+
+    elif method == "k_medoids":
+        try:
+            from sklearn_extra.cluster import KMedoids  # type: ignore
+            kmedoids = KMedoids(
+                n_clusters=k,
+                metric="precomputed",
+                init="k-medoids++",
+                random_state=random_state,
+            )
+            kmedoids.fit(distances)
+            selected = np.array(kmedoids.medoid_indices_)
+        except ImportError:
+            print(
+                "sklearn_extra is not installed – falling back to "
+                "'mean_distance' strategy for diversity selection."
+            )
+            mean_dist = np.mean(distances, axis=1)
+            selected = np.argsort(-mean_dist)[:k]
+
+    elif method == "dpp":
+        # Greedy farthest‑point algorithm (approximates a k‑DPP). Start
+        # with the most *distant* point to maximise subsequent spread
+        first = int(np.argmax(np.mean(distances, axis=1)))
+        selected = [first]
+
+        while len(selected) < k:
+            remaining = list(set(range(n_samples)) - set(selected))
+            # For each remaining point compute its distance to the closest
+            # already selected point.
+            min_dist_to_selected = np.min(distances[remaining][:, selected], axis=1)
+            # Choose the point that maximises this distance.
+            next_idx = remaining[int(np.argmax(min_dist_to_selected))]
+            selected.append(next_idx)
+
+        selected = np.array(selected)
+
+    else:
+        raise ValueError(
+            "Unknown diversity selection method: {}. Choose from "
+            "'mean_distance', 'k_medoids', or 'dpp'.".format(method)
+        )
+
+    return selected
+
+
+# ----------------------------------------------------------------------
+#  Decide *how many* points to keep in a cluster (inter‑cluster balance)
+#  using the JSD‑based objective from the original implementation, then
+#  pass the decision to a diversity‑aware selector for the actual sample
+#  choice (intra‑cluster coverage).
+# ----------------------------------------------------------------------
+
+
+def optimize_cluster_removal(embeddings_cluster, t, selection_method="mean_distance"):
+    """Find the optimal fraction of samples to remove from a cluster using grid search."""
     print(f"Starting optimization for cluster with {len(embeddings_cluster)} samples")
+    
     # Compute pairwise distances
     print("Computing pairwise distances...")
-    distances = pairwise_distances(embeddings_cluster, n_jobs=-1)
+    distances = pairwise_distances(embeddings_cluster, n_jobs=-1, metric='euclidean')  # Use euclidean on normalized vectors
     
-    # Compute original similarity distribution
-    print("Computing original similarity distribution...")
-    similarities = 1 / (1 + distances + 1e-10)
-    original_dist = similarities.flatten()
-    original_dist = original_dist / np.sum(original_dist)
+    # Precompute summary statistics
+    print("Computing distance summary statistics...")
+    sample_summaries = precompute_distance_summaries(distances)
     
-    # Optimize removal fraction
-    print("Optimizing removal fraction...")
-    result = minimize(
-        lambda r: compute_pruning_objective(r, distances, t, original_dist),
-        x0=0.3,
-        bounds=[(0.01, 0.99)],
-        method='L-BFGS-B',  # Use L-BFGS-B for bound constraints
-        options={'maxiter': 300}
-    )
+    # Create original histograms for each summary statistic
+    hist_bins = 10  # Number of bins in histogram
+    original_hists = []
     
-    optimal_r = result.x[0]
-    print(f"Optimal removal fraction: {optimal_r:.4f}")
+    # Create histograms for each of the 5 summary statistics
+    for i in range(sample_summaries.shape[1]):
+        min_val = np.min(sample_summaries[:, i])
+        max_val = np.max(sample_summaries[:, i])
+        
+        # Handle edge case where min equals max
+        if min_val == max_val:
+            orig_hist = np.ones(hist_bins) / hist_bins
+        else:
+            bin_edges = np.linspace(min_val, max_val, hist_bins + 1)
+            orig_hist, _ = np.histogram(sample_summaries[:, i], bins=bin_edges, density=True)
+            # Ensure histogram sums to 1
+            if np.sum(orig_hist) > 0:
+                orig_hist = orig_hist / np.sum(orig_hist)
+            else:
+                orig_hist = np.ones(hist_bins) / hist_bins
+        
+        original_hists.append(orig_hist)
     
-    # Determine indices to keep
-    print("Determining indices to keep...")
-    n_samples = len(distances)
+    # Combine histograms into a single feature vector
+    original_hist_combined = np.concatenate(original_hists)
+    
+    # Find optimal removal fraction using grid search instead of optimizer
+    try:
+        # Use grid search instead of minimize
+        optimal_r = grid_search_optimal_removal(distances, t, original_hist_combined)
+        print(f"Grid search successful. Optimal removal fraction: {optimal_r:.4f}")
+    except Exception as e:
+        print(f"Grid search failed: {e}")
+        # Fallback to default removal fraction
+        optimal_r = 0.3
+        print(f"Using fallback removal fraction: {optimal_r:.4f}")
+    
+    # ------------------------------------------------------------------
+    #  Intra‑cluster selection – choose *which* samples to keep.
+    # ------------------------------------------------------------------
+
+    print("Selecting concrete samples to keep with '{}' strategy...".format(selection_method))
+
+    n_samples = len(embeddings_cluster)
     n_keep = max(2, int(n_samples * (1 - optimal_r)))
-    
-    sorted_indices = np.argsort(distances.sum(axis=1))
-    keep_indices = sorted_indices[:n_keep]
-    
+
+    keep_indices = select_diverse_samples(
+        embeddings_cluster, k=n_keep, method=selection_method
+    )
+
     return keep_indices, optimal_r
 
 
-def process_single_cluster(cluster_id, cluster_indices, normalized_embeddings, min_cluster_size, t):
+# ----------------------------------------------------------------------
+#  Wrapper for parallel execution that combines the inter‑cluster JSD
+#  decision with the intra‑cluster diversity selector.
+# ----------------------------------------------------------------------
+
+
+def process_single_cluster(
+    cluster_id,
+    cluster_indices,
+    normalized_embeddings,
+    min_cluster_size,
+    t,
+    selection_method="mean_distance",
+):
     """Process a single cluster - for parallel execution."""
-    if cluster_id == -1 or len(cluster_indices) <= min_cluster_size:
-        # Keep all samples from noise cluster or small clusters
-        print(f"Keeping all {len(cluster_indices)} samples from cluster {cluster_id} (noise or small cluster)")
+    # Treat very small clusters as indivisible, but process the noise
+    # cluster (‑1) like any other to avoid over‑representing easy negatives.
+    if cluster_id != -1 and len(cluster_indices) <= min_cluster_size:
+        print(f"Keeping all {len(cluster_indices)} samples from small cluster {cluster_id}")
         return cluster_indices, 0.0
     
     print(f"Processing cluster {cluster_id} with {len(cluster_indices)} samples")
@@ -205,25 +481,44 @@ def process_single_cluster(cluster_id, cluster_indices, normalized_embeddings, m
     # For very large clusters, apply a simple sampling strategy instead of optimization
     if len(cluster_indices) > 5000:
         print(f"Large cluster detected with {len(cluster_indices)} samples. Using simplified pruning.")
-        # Simple strategy: keep 50% of samples randomly
-        np.random.seed(42 + cluster_id)  # for reproducibility with different seed per cluster
-        keep_ratio = 0.5
+        # Keep a fixed ratio but still pick diverse samples within the cluster.
+        # Here we prune 60 % (r = 0.6) and **keep** the remaining 40 %.
+        keep_ratio = 0.4  # fraction of items to keep
         keep_count = max(min_cluster_size, int(len(cluster_indices) * keep_ratio))
-        keep_indices_local = np.random.choice(len(cluster_indices), keep_count, replace=False)
+
+        # Use the diversity‑aware selector even for the simplified path to
+        # preserve intra‑cluster coverage.
+        cluster_embeddings = normalized_embeddings[cluster_indices].numpy()
+        keep_indices_local = select_diverse_samples(
+            cluster_embeddings,
+            k=keep_count,
+            method=selection_method,
+        )
         optimal_r = 1.0 - keep_ratio
     else:
         # Get embeddings for this cluster
         cluster_embeddings = normalized_embeddings[cluster_indices].numpy()
         
-        # Optimize pruning for this cluster
+        # Optimize pruning for this cluster – obtain the number of items
+        # to keep via the JSD term, then pick actual samples with the
+        # requested diversity‑aware selector.
         try:
-            keep_indices_local, optimal_r = optimize_cluster_removal(cluster_embeddings, t)
+            keep_indices_local, optimal_r = optimize_cluster_removal(
+                cluster_embeddings, t, selection_method=selection_method
+            )
         except Exception as e:
             print(f"Error in optimization for cluster {cluster_id}: {e}")
             # Fallback to a simple strategy
-            keep_ratio = 0.7  # Keep 70% as a fallback
+            keep_ratio = 0.6  # Keep 60% as a fallback
             keep_count = max(min_cluster_size, int(len(cluster_indices) * keep_ratio))
-            keep_indices_local = np.arange(keep_count)  # Keep the first keep_count samples
+            # Use the diversity‑aware selector instead of taking the first
+            # *keep_count* samples in order to maintain coverage.
+            cluster_embeddings = normalized_embeddings[cluster_indices].numpy()
+            keep_indices_local = select_diverse_samples(
+                cluster_embeddings,
+                k=keep_count,
+                method=selection_method,
+            )
             optimal_r = 1.0 - keep_ratio
     
     # Map local indices back to global indices
@@ -240,7 +535,20 @@ def process_single_cluster(cluster_id, cluster_indices, normalized_embeddings, m
     return keep_indices_global, optimal_r
 
 
-def prune_dataset(embeddings, labels, min_cluster_size, min_samples, t):
+# ----------------------------------------------------------------------
+#  Main driver.  Adds `selection_method` so the user can control the
+#  intra‑cluster selector from the CLI.
+# ----------------------------------------------------------------------
+
+
+def prune_dataset(
+    embeddings,
+    labels,
+    min_cluster_size,
+    min_samples,
+    t,
+    selection_method="mean_distance",
+):
     """Apply HDBSCAN clustering and prune each cluster."""
     print("Starting dataset pruning process...")
     # Normalize embeddings
@@ -252,10 +560,12 @@ def prune_dataset(embeddings, labels, min_cluster_size, min_samples, t):
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
-        metric='euclidean',
+        metric='euclidean',  # Using euclidean on normalized embeddings is equivalent to cosine distance
         cluster_selection_method='eom',
         core_dist_n_jobs=-1  # Use all available cores
     )
+    # Using euclidean on normalized embeddings is mathematically equivalent to cosine distance
+    print("Using euclidean distance on normalized vectors (mathematically equivalent to cosine distance)")
     cluster_labels = clusterer.fit_predict(normalized_embeddings.numpy())
     
     unique_clusters = np.unique(cluster_labels)
@@ -274,7 +584,14 @@ def prune_dataset(embeddings, labels, min_cluster_size, min_samples, t):
     
     # Process clusters in parallel
     results = Parallel(n_jobs=-1)(
-        delayed(process_single_cluster)(cluster_id, cluster_indices, normalized_embeddings, min_cluster_size, t)
+        delayed(process_single_cluster)(
+            cluster_id,
+            cluster_indices,
+            normalized_embeddings,
+            min_cluster_size,
+            t,
+            selection_method,
+        )
         for cluster_id, cluster_indices in cluster_data
     )
     
@@ -290,6 +607,7 @@ def prune_dataset(embeddings, labels, min_cluster_size, min_samples, t):
         }
     
     print(f"Keeping {len(all_indices_to_keep)} samples out of {len(embeddings)}")
+    
     return np.array(all_indices_to_keep), cluster_stats, cluster_labels
 
 
@@ -335,6 +653,20 @@ if __name__ == "__main__":
                         help="Directory to save pruned dataset info")
     parser.add_argument("--n_random_runs", type=int, default=5,
                         help="Number of random baseline runs for statistical significance")
+    parser.add_argument("--embeddings_path", type=str, default=None,
+                        help="Path to pre-extracted embeddings (skip extraction if provided)")
+    
+    # Intra‑cluster diversity selection strategy
+    parser.add_argument("--selection_method", type=str, default="mean_distance",
+                        choices=["mean_distance", "k_medoids", "dpp"],
+                        help="Strategy for intra-cluster diverse sample selection")
+    
+    # Deprecated: embedding_distance_metric used to exist for cosine/euclidean
+    # distance choice. The selector now works on normalized embeddings with
+    # Euclidean distance (equivalent to cosine) so we keep the argument but
+    # hide it to avoid breaking existing scripts.
+    parser.add_argument("--embedding_distance_metric", type=str, default="cosine",
+                        help=argparse.SUPPRESS)
     
     args = parser.parse_args()
     
@@ -348,33 +680,42 @@ if __name__ == "__main__":
     valid_dataset = get_dataset(args.dataset, args.dataset_dir, subset="valid")
     test_dataset = get_dataset(args.dataset, args.dataset_dir, subset="test")
     
-    # Setup dataloaders
-    contrastive_train_dataset = ContrastiveDataset(
-        train_dataset,
-        input_shape=(1, args.audio_length),
-        transform=None  # No transformations for embedding extraction
-    )
-    
-    train_loader = DataLoader(
-        contrastive_train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        shuffle=False  # Don't shuffle to keep track of indices
-    )
-    
-    # Load encoder
-    encoder = SampleCNN(
-        strides=[3, 3, 3, 3, 3, 3, 3, 3, 3],
-        supervised=args.supervised,
-        out_dim=train_dataset.n_classes,
-    )
-    
-    state_dict = load_encoder_checkpoint(args.checkpoint_path, train_dataset.n_classes)
-    encoder.load_state_dict(state_dict)
-    
-    # Extract embeddings
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    embeddings, labels = extract_embeddings(encoder, train_loader, device)
+    # Check if embeddings path is provided
+    if args.embeddings_path:
+        # Load pre-extracted embeddings
+        embeddings, labels = load_embeddings(args.embeddings_path)
+    else:
+        # Setup dataloaders for embedding extraction
+        contrastive_train_dataset = ContrastiveDataset(
+            train_dataset,
+            input_shape=(1, args.audio_length),
+            transform=None  # No transformations for embedding extraction
+        )
+        
+        train_loader = DataLoader(
+            contrastive_train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            shuffle=False  # Don't shuffle to keep track of indices
+        )
+        
+        # Load encoder
+        encoder = SampleCNN(
+            strides=[3, 3, 3, 3, 3, 3, 3, 3, 3],
+            supervised=args.supervised,
+            out_dim=train_dataset.n_classes,
+        )
+        
+        state_dict = load_encoder_checkpoint(args.checkpoint_path, train_dataset.n_classes)
+        encoder.load_state_dict(state_dict)
+        
+        # Extract embeddings
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        embeddings, labels = extract_embeddings(encoder, train_loader, device)
+        
+        # Save embeddings for future use
+        embeddings_path = os.path.join(output_dir, "extracted_embeddings.pt")
+        save_embeddings(embeddings, labels, embeddings_path)
     
     # Prune dataset with optimized method
     indices_to_keep, cluster_stats, cluster_labels = prune_dataset(
@@ -382,9 +723,19 @@ if __name__ == "__main__":
         labels, 
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
-        t=args.t
+        t=args.t,
+        selection_method=args.selection_method
     )
-    
+
+    # Validate optimized indices against the loaded train_dataset size before saving
+    original_indices_count_opt = len(indices_to_keep)
+    indices_to_keep = np.array(indices_to_keep) # Ensure it's a numpy array for filtering
+    max_valid_index = len(train_dataset)
+    indices_to_keep = indices_to_keep[indices_to_keep < max_valid_index]
+    filtered_count_opt = original_indices_count_opt - len(indices_to_keep)
+    if filtered_count_opt > 0:
+        print(f"Warning: Removed {filtered_count_opt} indices (>= {max_valid_index}) from optimized set before saving.")
+
     # Save optimized indices and statistics
     np.save(os.path.join(output_dir, "indices_to_keep.npy"), indices_to_keep)
     np.save(os.path.join(output_dir, "cluster_labels.npy"), cluster_labels)
@@ -393,6 +744,13 @@ if __name__ == "__main__":
     random_indices_list = []
     for run in range(args.n_random_runs):
         random_indices = random_baseline_pruning(cluster_labels, cluster_stats)
+        # Validate indices before saving
+        original_indices_count_random = len(random_indices)
+        max_valid_index = len(train_dataset) # Use the same max index as before
+        random_indices = random_indices[random_indices < max_valid_index]
+        filtered_count_random = original_indices_count_random - len(random_indices)
+        if filtered_count_random > 0:
+            print(f"Warning: Removed {filtered_count_random} indices (>= {max_valid_index}) from random run {run} set before saving.")
         random_indices_list.append(random_indices)
         np.save(os.path.join(output_dir, f"random_indices_run_{run}.npy"), random_indices)
     

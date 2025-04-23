@@ -17,6 +17,10 @@ def evaluate(
     est_array = []
     gt_array = []
 
+    # Convert device string to torch.device if needed
+    if isinstance(device, str):
+        device = torch.device(device)
+    
     encoder = encoder.to(device)
     encoder.eval()
 

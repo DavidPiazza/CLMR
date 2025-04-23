@@ -48,98 +48,142 @@ def load_pruned_dataset(args):
 
 def evaluate_multiple_runs(args, indices_list, run_names, train_dataset, valid_dataset, test_dataset, module):
     """Evaluate multiple pruning runs and compute statistical significance."""
-    results_list = []
+    results_list = []       # list of lists: one sub‑list per run_name
     
     for indices, run_name in zip(indices_list, run_names):
         print(f"\nEvaluating run: {run_name}")
         print(f"Number of indices: {len(indices)}")
         
-        # Create pruned dataset for this run
-        pruned_train_dataset = PrunedMAGNATAGATUNE(train_dataset, indices)
-        print(f"Pruned dataset size: {len(pruned_train_dataset)}")
+        split_results = []
+        for split_idx in range(args.n_splits):
+            pl.seed_everything(args.seed + split_idx)
+            # Create pruned dataset for this run
+            pruned_train_dataset = PrunedMAGNATAGATUNE(train_dataset, indices)
+            print(f"Pruned dataset size: {len(pruned_train_dataset)}")
+            
+            # Adjust batch size if needed to prevent index out of bounds
+            adjusted_batch_size = min(args.finetuner_batch_size, len(pruned_train_dataset))
+            if adjusted_batch_size != args.finetuner_batch_size:
+                print(f"Warning: Adjusted batch size from {args.finetuner_batch_size} to {adjusted_batch_size} to match pruned dataset size")
+            
+            # Setup dataloaders
+            contrastive_train_dataset = ContrastiveDataset(
+                pruned_train_dataset,
+                input_shape=(1, args.audio_length),
+                transform=Compose(train_transform),
+            )
+            
+            contrastive_valid_dataset = ContrastiveDataset(
+                valid_dataset,
+                input_shape=(1, args.audio_length),
+                transform=Compose(train_transform),
+            )
+            
+            contrastive_test_dataset = ContrastiveDataset(
+                test_dataset,
+                input_shape=(1, args.audio_length),
+                transform=None,
+            )
+            
+            print(f"Contrastive train dataset size: {len(contrastive_train_dataset)}")
+            print(f"Contrastive valid dataset size: {len(contrastive_valid_dataset)}")
+            print(f"Contrastive test dataset size: {len(contrastive_test_dataset)}")
+            
+            train_loader = DataLoader(
+                contrastive_train_dataset,
+                batch_size=adjusted_batch_size,
+                num_workers=args.workers,
+                shuffle=True,
+                persistent_workers=True if args.workers > 0 else False,
+            )
+            
+            valid_loader = DataLoader(
+                contrastive_valid_dataset,
+                batch_size=adjusted_batch_size,
+                num_workers=args.workers,
+                shuffle=False,
+                persistent_workers=True if args.workers > 0 else False,
+            )
+            
+            test_loader = DataLoader(
+                contrastive_test_dataset,
+                batch_size=adjusted_batch_size,
+                num_workers=args.workers,
+                shuffle=False,
+                persistent_workers=True if args.workers > 0 else False,
+            )
+            
+            # Train and evaluate
+            early_stop_callback = EarlyStopping(
+                monitor="Valid/loss", patience=10, verbose=False, mode="min"
+            )
+            
+            # Check for MPS availability
+            if args.use_mps and torch.backends.mps.is_available():
+                print("MPS (Metal Performance Shaders) is available. Using MPS for acceleration.")
+                device = torch.device("mps")
+                accelerator = "mps"  # Update this to use MPS accelerator
+            elif args.gpus > 0:
+                if torch.cuda.is_available():
+                    print(f"Using CUDA GPU acceleration with {args.gpus} GPUs.")
+                    device = torch.device("cuda:0")
+                    accelerator = "gpu"
+                else:
+                    print("CUDA GPU requested but not available. Falling back to CPU.")
+                    device = torch.device("cpu")
+                    accelerator = "cpu"
+                    args.gpus = 0
+            else:
+                print("Using CPU for computation.")
+                device = torch.device("cpu")
+                accelerator = "cpu"
+            
+            trainer = Trainer(
+                logger=TensorBoardLogger(
+                    "runs", name=f"CLMRv2-{run_name}-{args.dataset}"
+                ),
+                max_epochs=args.finetuner_max_epochs,
+                callbacks=[early_stop_callback],
+                devices=1 if args.gpus or args.use_mps else 0,
+                accelerator=accelerator,
+            )
+            
+            trainer.fit(module, train_loader, valid_loader)
+            
+            # Evaluate
+            if args.use_mps and torch.backends.mps.is_available():
+                device = "mps"
+            elif args.gpus > 0 and torch.cuda.is_available():
+                device = "cuda:0"
+            else:
+                device = "cpu"
+            
+            results = evaluate(
+                module.encoder,
+                module.model,
+                contrastive_test_dataset,
+                args.dataset,
+                args.audio_length,
+                device=device,
+            )
+            
+            split_results.append(results)
         
-        # Adjust batch size if needed to prevent index out of bounds
-        adjusted_batch_size = min(args.finetuner_batch_size, len(pruned_train_dataset))
-        if adjusted_batch_size != args.finetuner_batch_size:
-            print(f"Warning: Adjusted batch size from {args.finetuner_batch_size} to {adjusted_batch_size} to match pruned dataset size")
+        # Compute mean of split results for logging / saving
+        mean_results = {}
+        for key in split_results[0].keys():
+            mean_results[key] = np.mean([r[key] for r in split_results])
         
-        # Setup dataloaders
-        contrastive_train_dataset = ContrastiveDataset(
-            pruned_train_dataset,
-            input_shape=(1, args.audio_length),
-            transform=Compose(train_transform),
-        )
+        print(f"Mean results for run {run_name}:")
+        for k, v in mean_results.items():
+            print(f"{k}: {v}")
         
-        contrastive_valid_dataset = ContrastiveDataset(
-            valid_dataset,
-            input_shape=(1, args.audio_length),
-            transform=Compose(train_transform),
-        )
-        
-        contrastive_test_dataset = ContrastiveDataset(
-            test_dataset,
-            input_shape=(1, args.audio_length),
-            transform=None,
-        )
-        
-        print(f"Contrastive train dataset size: {len(contrastive_train_dataset)}")
-        print(f"Contrastive valid dataset size: {len(contrastive_valid_dataset)}")
-        print(f"Contrastive test dataset size: {len(contrastive_test_dataset)}")
-        
-        train_loader = DataLoader(
-            contrastive_train_dataset,
-            batch_size=adjusted_batch_size,
-            num_workers=args.workers,
-            shuffle=True,
-        )
-        
-        valid_loader = DataLoader(
-            contrastive_valid_dataset,
-            batch_size=adjusted_batch_size,
-            num_workers=args.workers,
-            shuffle=False,
-        )
-        
-        test_loader = DataLoader(
-            contrastive_test_dataset,
-            batch_size=adjusted_batch_size,
-            num_workers=args.workers,
-            shuffle=False,
-        )
-        
-        # Train and evaluate
-        early_stop_callback = EarlyStopping(
-            monitor="Valid/loss", patience=10, verbose=False, mode="min"
-        )
-        
-        trainer = Trainer.from_argparse_args(
-            args,
-            logger=TensorBoardLogger(
-                "runs", name=f"CLMRv2-{run_name}-{args.dataset}"
-            ),
-            max_epochs=args.finetuner_max_epochs,
-            callbacks=[early_stop_callback],
-        )
-        
-        trainer.fit(module, train_loader, valid_loader)
-        
-        # Evaluate
-        device = "cuda:0" if args.gpus else "cpu"
-        results = evaluate(
-            module.encoder,
-            module.model,
-            contrastive_test_dataset,
-            args.dataset,
-            args.audio_length,
-            device=device,
-        )
-        
-        results_list.append(results)
-        
-        # Save results for this run
+        # Save mean results for this run
         with open(os.path.join(results_dir, f"{run_name}_results.txt"), "w") as f:
-            for k, v in results.items():
+            for k, v in mean_results.items():
                 f.write(f"{k}: {v}\n")
+        
+        results_list.append(split_results)
     
     return results_list
 
@@ -155,31 +199,62 @@ def compute_statistical_significance(optimized_results, random_results):
         random_values = [r[metric] for r in random_results]
         
         t_stat, p_value = stats.ttest_ind(optimized_values, random_values)
+        
+        pooled_std = np.sqrt(
+            ((len(optimized_values) - 1) * np.var(optimized_values, ddof=1) +
+             (len(random_values) - 1) * np.var(random_values, ddof=1))
+            / (len(optimized_values) + len(random_values) - 2)
+        )
+        cohen_d = (np.mean(optimized_values) - np.mean(random_values)) / pooled_std
+        delta_pct = 100 * (np.mean(optimized_values) - np.mean(random_values)) / np.mean(random_values)
+        
         significance[metric] = {
             "t_statistic": float(t_stat),
             "p_value": float(p_value),
-            "significant": bool(p_value < 0.05)
+            "significant": bool(p_value < 0.05),
+            "cohen_d": float(cohen_d),
+            "delta_percent": float(delta_pct),
         }
     
     return significance
 
+def add_trainer_specific_args(parser):
+    """Add PyTorch Lightning Trainer specific arguments to parser."""
+    parser.add_argument("--gpus", type=int, default=0, help="Number of GPUs to use")
+    parser.add_argument("--use_mps", action="store_true", help="Use MPS (Metal Performance Shaders) for Apple Silicon")
+    parser.add_argument("--precision", type=int, default=32, help="Precision for training (16, 32)")
+    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training")
+    return parser
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate pruned dataset")
-    parser = Trainer.add_argparse_args(parser)
-
+    
+    # Load config first
     config = yaml_config_hook("./config/config.yaml")
+    
+    # Add trainer specific arguments
+    parser = add_trainer_specific_args(parser)
+    
+    # Add all config arguments that aren't already defined
+    added_args = set([action.dest for action in parser._actions])
     for k, v in config.items():
-        parser.add_argument(f"--{k}", default=v, type=type(v))
+        if k not in added_args:
+            parser.add_argument(f"--{k}", default=v, type=type(v))
     
     # Add pruned dataset path argument
     parser.add_argument("--pruned_dataset_path", type=str, required=True,
                         help="Path to the pruned dataset directory")
     parser.add_argument("--eval_name", type=str, default="pruned-eval",
                         help="Name for the evaluation run")
+    parser.add_argument(
+        "--n_splits",
+        type=int,
+        default=20,
+        help="Number of Monte‑Carlo train/valid splits per pruning condition",
+    )
     
     args = parser.parse_args()
     pl.seed_everything(args.seed)
-    args.accelerator = None
 
     if not os.path.exists(args.checkpoint_path):
         raise FileNotFoundError("Checkpoint does not exist")
@@ -242,14 +317,31 @@ if __name__ == "__main__":
     all_indices = [optimized_indices] + random_indices_list
     run_names = ["optimized"] + [f"random_run_{i}" for i in range(len(random_indices_list))]
     
-    results_list = evaluate_multiple_runs(args, all_indices, run_names, train_dataset, valid_dataset, test_dataset, module)
-
+    # For pretrained finetuner, create a test dataset for evaluation
     if args.finetuner_checkpoint_path:
-        # If using pre-trained finetuner, just evaluate once
+        # Setup test dataset
+        contrastive_test_dataset = ContrastiveDataset(
+            test_dataset,
+            input_shape=(1, args.audio_length),
+            transform=None,
+        )
+        
+        # Load pretrained finetuner weights
         state_dict = load_finetuner_checkpoint(args.finetuner_checkpoint_path)
         module.model.load_state_dict(state_dict)
         
-        device = "cuda:0" if args.gpus else "cpu"
+        # Set device based on availability and user preferences
+        if args.use_mps and torch.backends.mps.is_available():
+            device = "mps"
+        elif args.gpus and torch.cuda.is_available():
+            device = "cuda:0"
+        else:
+            device = "cpu"
+        
+        # Move module components to the right device
+        module.encoder = module.encoder.to(device)
+        module.model = module.model.to(device)
+        
         results = evaluate(
             module.encoder,
             module.model,
@@ -265,9 +357,14 @@ if __name__ == "__main__":
             for k, v in results.items():
                 f.write(f"{k}: {v}\n")
     else:
+        # Run full training and evaluation
+        results_list = evaluate_multiple_runs(args, all_indices, run_names, train_dataset, valid_dataset, test_dataset, module)
+        
+        # Flatten per‑split lists so stats work transparently
+        optimized_results = [item for sub in results_list[:1] for item in sub]
+        random_results = [item for sub in results_list[1:] for item in sub]
+        
         # Compute statistical significance
-        optimized_results = results_list[:1]
-        random_results = results_list[1:]
         significance = compute_statistical_significance(optimized_results, random_results)
         
         # Save statistical significance results
@@ -279,4 +376,4 @@ if __name__ == "__main__":
             print(f"\n{metric}:")
             print(f"  t-statistic: {stats['t_statistic']:.4f}")
             print(f"  p-value: {stats['p_value']:.4f}")
-            print(f"  Significant: {stats['significant']}") 
+            print(f"  Significant: {stats['significant']}")
