@@ -2,3 +2,4 @@
 __pycache__
 /data
 runs/
+pruned_data/pruned_magnatagatune_20250406_173503/extracted_embeddings.pt
