@@ -1,6 +1,6 @@
 ## Redundancy Pruning for Audio Datasets (Extended CLMR)
 
-This repository extends the work of Spijkervet and Burgoyne (CLMR) by introducing a redundancy pruning workflow for audio datasets, specifically MagnaTagATune. Our approach leverages density-based clustering and intra-cluster diversity selection to remove redundant samples, enabling more efficient and potentially more robust representation learning and evaluation.
+This repository builds on the work of Spijkervet and Burgoyne (CLMR) to introduce a redundancy pruning workflow for audio datasets. Our approach leverages density-based clustering and intra-cluster diversity selection to remove redundant samples, enabling more efficient and potentially more robust representation learning and evaluation.
 
 ### Method Overview
 1. **Extract Embeddings:** Use a pre-trained CLMR model to extract embeddings for all samples in the dataset.
