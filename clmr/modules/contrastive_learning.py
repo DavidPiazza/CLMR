@@ -37,12 +37,14 @@ class ContrastiveLearning(LightningModule):
         batch_size = self.hparams.batch_size
         
         # Check if running in distributed mode
-        if hasattr(self.hparams, 'accelerator'):
-            if self.hparams.accelerator == "dp" and self.hparams.gpus:
-                batch_size = int(self.hparams.batch_size / self.hparams.gpus)
-        elif self.hparams.gpus and self.hparams.gpus > 1:
-            # Assume DP mode for backward compatibility
-            batch_size = int(self.hparams.batch_size / self.hparams.gpus)
+        devices = getattr(self.hparams, 'devices', None)
+        accelerator = getattr(self.hparams, 'accelerator', None)
+        if accelerator == "dp" and devices:
+            batch_size = int(self.hparams.batch_size / devices)
+        elif devices and devices > 1:
+            batch_size = int(self.hparams.batch_size / devices)
+        # Default to mps if available
+        # (handled in main.py for Trainer, so not needed here)
 
         criterion = NT_Xent(batch_size, self.hparams.temperature, world_size=1)
         return criterion

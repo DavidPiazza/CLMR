@@ -4,6 +4,8 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
+import torch
+import numpy as np
 
 # Audio Augmentations
 from torchaudio_augmentations import (
@@ -25,16 +27,18 @@ from clmr.evaluation import evaluate
 from clmr.models import SampleCNN
 from clmr.modules import ContrastiveLearning, SupervisedLearning
 from clmr.utils import yaml_config_hook
+from clmr.datasets.pruned import PrunedMAGNATAGATUNE
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="CLMR")
-    parser = Trainer.add_argparse_args(parser)
+    
 
     config = yaml_config_hook("./config/config.yaml")
     for k, v in config.items():
         parser.add_argument(f"--{k}", default=v, type=type(v))
+    parser.add_argument("--indices_file", type=str, default=None, help="Path to numpy file of indices to use for pruned training set")
 
     args = parser.parse_args()
     pl.seed_everything(args.seed)
@@ -74,6 +78,9 @@ if __name__ == "__main__":
     # dataloaders
     # ------------
     train_dataset = get_dataset(args.dataset, args.dataset_dir, subset="train")
+    if args.indices_file is not None:
+        indices = np.load(args.indices_file)
+        train_dataset = PrunedMAGNATAGATUNE(train_dataset, indices)
     valid_dataset = get_dataset(args.dataset, args.dataset_dir, subset="valid")
     contrastive_train_dataset = ContrastiveDataset(
         train_dataset,
@@ -140,14 +147,23 @@ if __name__ == "__main__":
         else:
             early_stopping = None
 
-        trainer = Trainer.from_argparse_args(
-            args,
+        # Configure accelerator based on available hardware
+        if torch.backends.mps.is_available():
+            args.accelerator = "mps"
+            args.devices = 1
+        elif torch.cuda.is_available():
+            args.accelerator = "gpu"
+        else:
+            args.accelerator = "cpu"
+
+        trainer = Trainer(
             logger=logger,
             sync_batchnorm=True,
             max_epochs=args.max_epochs,
             log_every_n_steps=10,
             check_val_every_n_epoch=1,
             accelerator=args.accelerator,
+            devices=args.devices,
         )
         trainer.fit(module, train_loader, valid_loader)
 
@@ -160,7 +176,14 @@ if __name__ == "__main__":
             transform=None,
         )
 
-        device = "cuda:0" if args.gpus else "cpu"
+        # Use appropriate device for evaluation
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda:0"
+        else:
+            device = "cpu"
+            
         results = evaluate(
             module.encoder,
             None,

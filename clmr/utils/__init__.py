@@ -1,2 +1,3 @@
 from .checkpoint import load_encoder_checkpoint, load_finetuner_checkpoint
 from .yaml_config_hook import yaml_config_hook
+from .facility_coverage import expected_coverage_gain

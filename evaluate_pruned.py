@@ -207,13 +207,24 @@ def compute_statistical_significance(optimized_results, random_results):
         )
         cohen_d = (np.mean(optimized_values) - np.mean(random_values)) / pooled_std
         delta_pct = 100 * (np.mean(optimized_values) - np.mean(random_values)) / np.mean(random_values)
-        
+
+        # 95 % confidence interval for the difference of means
+        n1, n2 = len(optimized_values), len(random_values)
+        mean_diff = np.mean(optimized_values) - np.mean(random_values)
+        se_diff = np.sqrt(np.var(optimized_values, ddof=1)/n1 +
+                          np.var(random_values, ddof=1)/n2)
+        ci_low, ci_high = stats.t.interval(
+            0.95, df=n1 + n2 - 2, loc=mean_diff, scale=se_diff
+        )
+
         significance[metric] = {
             "t_statistic": float(t_stat),
             "p_value": float(p_value),
             "significant": bool(p_value < 0.05),
             "cohen_d": float(cohen_d),
             "delta_percent": float(delta_pct),
+            "ci_low": float(ci_low),
+            "ci_high": float(ci_high),
         }
     
     return significance

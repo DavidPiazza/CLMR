@@ -1,42 +1,56 @@
-# Contrastive Learning of Musical Representations
+## Redundancy Pruning for Audio Datasets (Extended CLMR)
 
-PyTorch implementation of [Contrastive Learning of Musical Representations](https://arxiv.org/abs/2103.09410) by Janne Spijkervet and John Ashley Burgoyne.
+This repository extends the work of Spijkervet and Burgoyne (CLMR) by introducing a redundancy pruning workflow for audio datasets, specifically MagnaTagATune. Our approach leverages density-based clustering and intra-cluster diversity selection to remove redundant samples, enabling more efficient and potentially more robust representation learning and evaluation.
 
-![CLMR](https://github.com/spijkervet/clmr/actions/workflows/clmr.yml/badge.svg)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Njz8EoN4br587xjpRKcssMuqQY6Cc5nj#scrollTo=aeKVT59FhWzV)
+### Method Overview
+1. **Extract Embeddings:** Use a pre-trained CLMR model to extract embeddings for all samples in the dataset.
+2. **Cluster with HDBSCAN:** Apply HDBSCAN clustering to partition the dataset into clusters based on embedding similarity.
+3. **Intra-cluster Pruning:** For each cluster, select a diverse subset of samples using facility-location optimization or other diversity-based strategies, removing redundant examples.
+4. **Save Pruned Indices:** The indices of retained samples are saved (e.g., as `indices_to_keep.npy`).
+5. **Preprocess Pruned Set:** Preprocess only the retained audio files for downstream training.
+6. **Train and Evaluate:** Train a CLMR model or a linear head using only the pruned dataset, and evaluate performance as usual.
 
-[![arXiv](https://img.shields.io/badge/arXiv-2103.09410-b31b1b.svg)](https://arxiv.org/abs/2103.09410)
-[![Supplementary Material](https://img.shields.io/badge/Supplementary%20Material-2103.09410-blue.svg)](https://github.com/Spijkervet/CLMR/releases/download/2.1/CLMR.-.Supplementary.Material.pdf)
+### Usage Steps
 
-<div class="header-image" style="display: flex; flex-direction: column; align-items: center;">
-  <a href="https://spijkervet.github.io/CLMR/examples/clmr-onnxruntime-web" target="_blank" style="text-decoration: none;">
-      <span style="font-size: 1.5rem; font-weight: 100;">CLMR x</span>
-      <img class="onnx-image" style="height: 20px;" src="https://onnxruntime.ai/images/svg/ONNX-Runtime-logo.svg"/>
-  </a>
-</div>
+#### 1. (Optional) Establish Baseline
+Train and evaluate a linear classifier on the full dataset for comparison:
+```bash
+python linear_evaluation.py --checkpoint_path /path/to/clmr/checkpoint.pt --dataset magnatagatune --dataset_dir ./data
+```
 
-You can run a pre-trained CLMR model directly from within your browser using ONNX Runtime: [here](https://spijkervet.github.io/CLMR/examples/clmr-onnxruntime-web).
+#### 2. Prune the Dataset
+Run the pruning script to generate a pruned set:
+```bash
+python prune_dataset.py --checkpoint_path /path/to/clmr/checkpoint.pt --dataset magnatagatune --dataset_dir ./data --min_cluster_size 20 --eps 0.05 --output_dir ./pruned_data
+```
+- `--min_cluster_size`: Minimum cluster size for HDBSCAN
+- `--eps`: Allowed loss of coverage inside each cluster (smaller = keep more samples)
+- `--output_dir`: Where to save pruned dataset info
 
+This will create a directory in `./pruned_data` with files like `indices_to_keep.npy` and `metadata.json`.
 
-In this work, we introduce SimCLR to the music domain and contribute a large chain of audio data augmentations, to form a simple framework for self-supervised learning of raw waveforms of music: CLMR. We evaluate the performance of the self-supervised learned representations on the task of music classification.
+#### 3. Preprocess the Pruned Dataset
+Preprocess only the retained files:
+```bash
+python preprocess.py --dataset magnatagatune --dataset_dir ./data --indices_file ./pruned_data/your_run/indices_to_keep.npy
+```
 
-- We achieve competitive results on the MagnaTagATune and Million Song Datasets relative to fully supervised training, despite only using a linear classifier on self-supervised learned representations, i.e., representations that were learned task-agnostically without any labels.
-- CLMR enables efficient classification: with only 1% of the labeled data, we achieve similar scores compared to using 100% of the labeled data.
-- CLMR is able to generalise to out-of-domain datasets: when training on entirely different music datasets, it is still able to perform competitively compared to fully supervised training on the target dataset.
+#### 4. Train on the Pruned Dataset
+Train a CLMR model using only the pruned set:
+```bash
+python main.py --dataset magnatagatune --dataset_dir ./data --indices_file ./pruned_data/your_run/indices_to_keep.npy
+```
 
-*This is the CLMR v2 implementation, for the original implementation go to the [`v1`](https://github.com/Spijkervet/CLMR/tree/v1) branch*
+#### 5. Evaluate the Pruned Set
+Evaluate a linear head on the pruned dataset:
+```bash
+python linear_evaluation.py --checkpoint_path /path/to/pruned/clmr_checkpoint.pt --dataset magnatagatune --dataset_dir ./data --indices_file ./pruned_data/your_run/indices_to_keep.npy
+```
 
-<div align="center">
-  <img width="50%" alt="CLMR model" src="https://github.com/Spijkervet/CLMR/blob/master/media/clmr_model.png?raw=true">
-</div>
-<div align="center">
-  An illustration of CLMR.
-</div>
-
-
-This repository relies on my SimCLR implementation, which can be found [here](https://github.com/spijkervet/simclr) and on my `torchaudio-augmentations` package, found [here](https://github.com/Spijkervet/torchaudio-augmentations).
-
-
+### Notes
+- This workflow enables direct comparison between models trained on the full and pruned datasets.
+- All scripts are compatible with the `--indices_file` argument to restrict training/evaluation to the pruned subset.
+- Results and checkpoints are saved as usual in the `runs/` directory.
 
 ## Quickstart
 ```
