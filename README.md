@@ -8,7 +8,7 @@ This repository builds on the work of Spijkervet and Burgoyne (CLMR) to introduc
 3. **Intra-cluster Pruning:** For each cluster, select a diverse subset of samples using facility-location optimization or other diversity-based strategies, removing redundant examples.
 4. **Save Pruned Indices:** The indices of retained samples are saved (e.g., as `indices_to_keep.npy`).
 5. **Preprocess Pruned Set:** Preprocess only the retained audio files for downstream training.
-6. **Train and Evaluate:** Train a CLMR model or a linear head using only the pruned dataset, and evaluate performance as usual.
+6. **Train and Evaluate:** Train a CLMR model or a linear head using only the pruned dataset, and evaluate performance.
 
 ### Usage Steps
 
@@ -19,13 +19,29 @@ python linear_evaluation.py --checkpoint_path /path/to/clmr/checkpoint.pt --data
 ```
 
 #### 2. Prune the Dataset
-Run the pruning script to generate a pruned set:
+Run the pruning script:
 ```bash
-python prune_dataset.py --checkpoint_path /path/to/clmr/checkpoint.pt --dataset magnatagatune --dataset_dir ./data --min_cluster_size 20 --eps 0.05 --output_dir ./pruned_data
+python prune_dataset.py \
+  --checkpoint_path /path/to/clmr/checkpoint.pt \
+  --dataset magnatagatune \
+  --dataset_dir ./data \
+  --min_cluster_size 75 \
+  --min_samples 1 \
+  --eps 0.5 \
+  --selection_method dpp \
+  --n_random_runs 10 \
+  --output_dir ./pruned_data
 ```
 - `--min_cluster_size`: Minimum cluster size for HDBSCAN
 - `--eps`: Allowed loss of coverage inside each cluster (smaller = keep more samples)
 - `--output_dir`: Where to save pruned dataset info
+Key arguments
+* `--min_cluster_size 75`: Minimum cluster size for the first-pass HDBSCAN clustering.
+* `--min_samples 1`: HDBSCAN `min_samples` hyper-parameter.
+* `--eps 0.5`: Allowed loss of facility-location coverage inside each cluster (smaller ⇒ keep more samples).
+* `--selection_method dpp`: Use the k-DPP-based intra-cluster diversity selection.
+* `--n_random_runs 10`: Generate ten random baseline prunings for statistical significance testing.
+* `--output_dir`: Where to save pruned dataset info (indices, metadata, random baselines).
 
 This will create a directory in `./pruned_data` with files like `indices_to_keep.npy` and `metadata.json`.
 
@@ -42,40 +58,15 @@ python main.py --dataset magnatagatune --dataset_dir ./data --indices_file ./pru
 ```
 
 #### 5. Evaluate the Pruned Set
-Evaluate a linear head on the pruned dataset:
+Evaluate the pruned subset **and its 10 random baselines** over **5 Monte-Carlo splits** using `evaluate_pruned.py`:
+
 ```bash
-python linear_evaluation.py --checkpoint_path /path/to/pruned/clmr_checkpoint.pt --dataset magnatagatune --dataset_dir ./data --indices_file ./pruned_data/your_run/indices_to_keep.npy
+python evaluate_pruned.py \
+  --checkpoint_path /path/to/clmr/checkpoint.pt \
+  --dataset magnatagatune \
+  --dataset_dir ./data \
+  --pruned_dataset_path ./pruned_data/your_run \
+  --n_splits 5
 ```
 
-### Notes
-- This workflow enables direct comparison between models trained on the full and pruned datasets.
-- All scripts are compatible with the `--indices_file` argument to restrict training/evaluation to the pruned subset.
-- Results and checkpoints are saved as usual in the `runs/` directory.
-
-The following command downloads MagnaTagATune, preprocesses it and starts self-supervised pre-training on 1 GPU (with 8 simultaneous CPU workers) and linear evaluation:
-```
-python3 preprocess.py --dataset magnatagatune
-
-# add --workers 8 to increase the number of parallel CPU threads to speed up online data augmentations + training.
-python3 main.py --dataset magnatagatune --gpus 1 --workers 8
-
-python3 linear_evaluation.py --gpus 1 --workers 8 --checkpoint_path [path to checkpoint.pt, usually in ./runs]
-```
-
-## Pre-train on your own folder of audio files
-Simply run the following command to pre-train the CLMR model on a folder containing .wav files (or .mp3 files when editing `src_ext_audio=".mp3"` in `clmr/datasets/audio.py`). You may need to convert your audio files to the correct sample rate first, before giving it to the encoder (which accepts `22,050Hz` per default).
-
-```
-python preprocess.py --dataset audio --dataset_dir ./directory_containing_audio_files
-
-python main.py --dataset audio --dataset_dir ./directory_containing_audio_files
-```
-
-## Configuration
-The configuration of training can be found in: `config/config.yaml`. I personally prefer to use files instead of long strings of arguments when configuring a run. Every entry in the config file can be overrided with the corresponding flag (e.g. `--max_epochs 500` if you would like to train with 500 epochs).
-
-## Logging and TensorBoard
-To view results in TensorBoard, run:
-```
-tensorboard --logdir ./runs
-```
+This script trains a linear evaluation head for each split, compares the performance of the optimized pruning against the 10 random baselines, and reports statistical significance.
