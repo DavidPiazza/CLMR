@@ -117,14 +117,18 @@ class LinearEvaluation(LightningModule):
             return {"optimizer": optimizer}
 
     def extract_representations(self, dataloader: DataLoader) -> Dataset:
-
+        # Determine the device from encoder parameters
+        device = next(self.encoder.parameters()).device
         representations = []
         ys = []
         for x, y in tqdm(dataloader):
+            # Move input to the encoder's device
+            x = x.to(device)
             with torch.no_grad():
                 h0 = self.encoder(x)
-                representations.append(h0)
-                ys.append(y)
+            # Move representations back to CPU for storage
+            representations.append(h0.cpu())
+            ys.append(y)
 
         if len(representations) > 1:
             representations = torch.cat(representations, dim=0)

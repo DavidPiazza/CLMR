@@ -22,15 +22,33 @@ from clmr.utils import (
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="SimCLR")
-    parser = Trainer.add_argparse_args(parser)
 
     config = yaml_config_hook("./config/config.yaml")
     for k, v in config.items():
         parser.add_argument(f"--{k}", default=v, type=type(v))
 
+    # Add Trainer arguments for MPS support
+    # parser.add_argument("--max_epochs", type=int, default=100, help="Number of epochs to train")
+    parser.add_argument("--accelerator", type=str, default="mps", help="Accelerator to use (cpu, gpu, mps)")
+    parser.add_argument("--devices", type=int, default=1, help="Number of devices to use")
+
     args = parser.parse_args()
     pl.seed_everything(args.seed)
-    args.accelerator = None
+    # Set accelerator and device automatically
+    import torch
+    if torch.backends.mps.is_available():
+        args.accelerator = "mps"
+        args.devices = 1
+        print("Using MPS accelerator.")
+    elif torch.cuda.is_available():
+        args.accelerator = "cuda"
+        args.devices = 1
+        print("Using CUDA accelerator.")
+    else:
+        args.accelerator = "cpu"
+        args.devices = 1
+        print("Using CPU.")
+    # args.accelerator is now set appropriately
 
     if not os.path.exists(args.checkpoint_path):
         raise FileNotFoundError("That checkpoint does not exist")
@@ -46,19 +64,19 @@ if __name__ == "__main__":
 
     contrastive_train_dataset = ContrastiveDataset(
         train_dataset,
-        input_shape=(1, args.audio_length),
+        input_shape=[1, args.audio_length],
         transform=Compose(train_transform),
     )
 
     contrastive_valid_dataset = ContrastiveDataset(
         valid_dataset,
-        input_shape=(1, args.audio_length),
+        input_shape=[1, args.audio_length],
         transform=Compose(train_transform),
     )
 
     contrastive_test_dataset = ContrastiveDataset(
         test_dataset,
-        input_shape=(1, args.audio_length),
+        input_shape=[1, args.audio_length],
         transform=None,
     )
 
@@ -132,17 +150,23 @@ if __name__ == "__main__":
             monitor="Valid/loss", patience=10, verbose=False, mode="min"
         )
 
-        trainer = Trainer.from_argparse_args(
-            args,
+        trainer = Trainer(
+            accelerator=args.accelerator,
+            devices=args.devices,
             logger=TensorBoardLogger(
                 "runs", name="CLMRv2-eval-{}".format(args.dataset)
             ),
-            max_epochs=args.finetuner_max_epochs,
+            max_epochs=args.max_epochs,
             callbacks=[early_stop_callback],
         )
         trainer.fit(module, train_loader, valid_loader)
 
-    device = "cuda:0" if args.gpus else "cpu"
+    if args.accelerator == "mps":
+        device = "mps"
+    elif args.accelerator == "cuda":
+        device = "cuda:0"
+    else:
+        device = "cpu"
     results = evaluate(
         module.encoder,
         module.model,
